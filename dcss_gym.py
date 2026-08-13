@@ -71,7 +71,11 @@ def scenarios(variant="b") -> Iterable[GymScenario]:
     names = tuple(name for name, _key in VARIANTS[variant])
     all_legal = [True] * len(names)
 
-    enemy = _screen(*_base_lines(monster="g   goblin", message="A goblin comes into view."))
+    enemy_lines = _base_lines(monster="g   goblin", message="A goblin comes into view.")
+    # The hostile is deliberately on the map, adjacent to @.  The message is
+    # supporting player-visible context, not a hidden label the policy gets.
+    enemy_lines[2] = "#......@g.....#............................  Health: 20/20"
+    enemy = _screen(*enemy_lines)
     yield GymScenario(
         "enemy_visible", "enemy recognition",
         _observation(enemy, names, all_legal), "autofight",

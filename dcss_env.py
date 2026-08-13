@@ -42,7 +42,10 @@ import pyte
 from dcss_contract import make_public_observation
 
 CRAWL_DIR = Path("/root/crawl/crawl-ref/source")
-PLAY_ROOT = Path("/root/rlplay")
+# This project intentionally runs beside another DCSS research checkout. Keep
+# every save, morgue and rc file separate so a trainer here cannot resume or
+# corrupt a game launched from the other project.
+PLAY_ROOT = Path("/root/rlplay_gym")
 COLS, ROWS = 80, 24
 
 # ── action space ──────────────────────────────────────────────────────────
@@ -357,7 +360,8 @@ def parse_status(screen):
 class _Crawl:
     """One crawl process on a pty, rendered to an 80x24 grid by pyte."""
 
-    def __init__(self, play_dir, name, seed=None, autopickup=False):
+    def __init__(self, play_dir, name, seed=None, autopickup=False,
+                 sprint_map=None):
         # `saves` matters: without it crawl starts, emits its terminal-init
         # sequence, and then blocks forever without drawing anything and
         # without exiting. The process looks perfectly healthy from outside —
@@ -406,6 +410,10 @@ class _Crawl:
         cmd += ["-extra-opt-last", "autopickup=$?!+/)(["]
         if seed is not None:
             cmd += ["-seed", str(seed)]
+        if sprint_map:
+            # Sprint maps are native DCSS layouts, not a second simulator. They
+            # make a compact, deterministic real-game curriculum possible.
+            cmd += ["-sprint", "-sprint-map", sprint_map]
 
         env = dict(os.environ, TERM="xterm-256color",
                    LINES=str(ROWS), COLUMNS=str(COLS))
@@ -509,12 +517,13 @@ class DCSSEnv:
     """
 
     def __init__(self, env_id=0, target_depth=5, max_steps=250, seed=None,
-                 variant="a"):
+                 variant="a", sprint_map=None):
         self.env_id = env_id
         self.target_depth = target_depth
         self.max_steps = max_steps
         self.seed = seed
         self.variant = variant
+        self.sprint_map = sprint_map
         self.spec = VARIANTS[variant]
         self.action_names = [n for n, _ in self.spec]
         self.n_actions = len(self.spec)
@@ -535,7 +544,8 @@ class DCSSEnv:
         # be rewarded for depth it reached under an older policy.
         shutil.rmtree(self.play_dir, ignore_errors=True)
 
-        self.c = _Crawl(self.play_dir, self.name, self.seed, autopickup=True)
+        self.c = _Crawl(self.play_dir, self.name, self.seed, autopickup=True,
+                        sprint_map=self.sprint_map)
         self.c.drain(quiet=0.4, timeout=25)
 
         self.steps = 0

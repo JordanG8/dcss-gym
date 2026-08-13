@@ -66,3 +66,29 @@ Write a rule-based teacher (approach visible monsters, auto-explore otherwise,
 retreat at low HP) against the glyph grid `webtiles_agent.py` already builds,
 then collect from that instead. Entropy should drop well below 1.0, and the
 training loop finally has signal to find.
+
+## DCSS Gym and spectator
+
+The Gym layer is intentionally player-legal: it sees the rendered terminal,
+status, menu text, and a mask of actions the UI currently permits. It never
+gets the server's complete map, unseen monsters, item identities, or combat
+rolls.
+
+```text
+# Fast deterministic curriculum: enemy recognition, recovery, and equipment.
+/root/pty-venv/bin/python train_gym.py --variant b
+
+# Run the real Crawl adapter against the versioned native Sprint map.
+/root/pty-venv/bin/python native_gym.py --install --smoke
+
+# Greedy, fixed held-out seeds (20 quick seeds; use --limit 100 for the suite).
+/root/pty-venv/bin/python evaluate.py --checkpoint data/gym_policy.b.pt --variant b
+
+# Local viewing: authentic live WebTiles plus exact terminal-observation replay.
+/root/pty-venv/bin/python spectator.py --data-root data
+# browse http://127.0.0.1:8101
+```
+
+For a PPO run, pass the Gym checkpoint as `data/rl_policy.b.pt` (or rename it)
+and start `train_rl.py --variant b --resume`. Gym mastery only confirms the
+interface and basic preferences; held-out real-game seeds remain the metric.

@@ -1,0 +1,22 @@
+# A tiny native DCSS Sprint map for curriculum and adapter smoke tests.
+#
+# The level contains a better axe, worse club, armour upgrade, and goblin.
+# DCSS controls the actual Sprint start square. The policy must still receive
+# only its rendered terminal screen; the map itself is deterministic.
+NAME: dcss_gym_equipment
+TAGS: sprint no_item_gen no_trap_gen no_pool_fixup no_rotate no_hmirror no_vmirror
+ORDER: 1
+ORIENT: encompass
+KITEM: a = war axe plus:2 pre_id
+KITEM: b = club pre_id
+KITEM: c = chain mail plus:2 pre_id
+KMONS: Q = goblin
+MAP
+xxxxxxxxxxxxxxxxxxxxxxxx
+x......................x
+x..1Qabc................x
+x......................x
+x......................x
+x......................x
+xxxxxxxxxxxxxxxxxxxxxxxx
+ENDMAP
