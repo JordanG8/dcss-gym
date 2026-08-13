@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local training outputs, checkpoints, replays, and collected data
+data/
+recordings/
+games*.jsonl
+*.pt
+*.ttyrec
+*.log
+
+# Local dashboard and process state
+*.pid
+*.lock
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
