@@ -90,5 +90,7 @@ rolls.
 ```
 
 For a PPO run, pass the Gym checkpoint as `data/rl_policy.b.pt` (or rename it)
-and start `train_rl.py --variant b --resume`. Gym mastery only confirms the
-interface and basic preferences; held-out real-game seeds remain the metric.
+and start `train_rl.py --variant b --resume --reset-heads`. This retains the
+Gym-trained visual/menu encoder but begins real Crawl with exploratory action
+and value heads. Gym mastery only confirms the interface and basic
+preferences; held-out real-game seeds remain the metric.

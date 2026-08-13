@@ -342,6 +342,9 @@ def main():
     ap.add_argument("--target-depth", type=int, default=5)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--reset-heads", action="store_true",
+                    help="keep a warm-start encoder but reset actor/critic "
+                         "for exploratory PPO transfer")
     ap.add_argument("--no-record", action="store_true",
                     help="skip saving watchable replays")
     ap.add_argument("--keep-replays", type=int, default=40)
@@ -377,6 +380,17 @@ def main():
             policy.load_state_dict(keep, strict=False)
             print(f"resumed from {src.name}: loaded {len(keep)} tensors, "
                   f"reinitialised {skipped}")
+            if args.reset_heads:
+                # A tiny supervised curriculum can (correctly) become nearly
+                # certain about its six fixtures, yet be disastrously certain
+                # on an unseen dungeon. Preserve its glyph/menu representation
+                # but let PPO begin with a broad action distribution and a
+                # fresh value estimate in the real game.
+                nn.init.orthogonal_(policy.actor.weight, gain=0.01)
+                nn.init.zeros_(policy.actor.bias)
+                nn.init.orthogonal_(policy.critic.weight, gain=1.0)
+                nn.init.zeros_(policy.critic.bias)
+                print("reset actor/critic heads after warm-start", flush=True)
     policy.to(device)
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"variant {args.variant} · params {n_params/1e6:.3f}M · device {device} · "
