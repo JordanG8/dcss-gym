@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pyte
 
+from dcss_contract import make_public_observation
+
 CRAWL_DIR = Path("/root/crawl/crawl-ref/source")
 PLAY_ROOT = Path("/root/rlplay")
 COLS, ROWS = 80, 24
@@ -589,6 +591,63 @@ class DCSSEnv:
         """Colour grid matching the screen the policy just saw."""
         return self.c.colors() if self.c else ""
 
+    def public_observation(self):
+        """Versioned player-legal observation for new policies and viewers.
+
+        This deliberately does not reach into Crawl internals.  It is built
+        from the screen, colour grid, and menu the player can see right now;
+        hidden state remains available only to test assertions and debugging.
+        """
+        screen = self.c.text() if self.c else ""
+        candidates = []
+        if self.menu_open:
+            candidates = [desc for _ltr, desc in RE_ITEM_LINE.findall(screen)
+                          if not RE_IN_USE.search(desc)]
+        return make_public_observation(
+            screen=screen,
+            colors=self.color_text(),
+            status=parse_status(screen),
+            menu_kind=self.menu_open,
+            menu_candidates=candidates,
+            action_names=self.action_names,
+            action_mask=self.action_mask(),
+        )
+
+    def action_mask(self):
+        """Boolean legality mask for the action represented by this screen.
+
+        Most DCSS choices are *semantically* legal but may be strategically
+        foolish (resting next to an adder, for example); those remain choices
+        for the policy.  This mask is deliberately narrower.  It only removes
+        actions that cannot possibly mean what their name says because the UI is
+        in a different phase.  In particular, a ``pick2`` is never a dungeon
+        action -- it only has meaning in the equipment menu that exposed a
+        second candidate.
+
+        The exact mask is stored with every PPO transition and used again while
+        optimizing, so the learner never trains on probability mass assigned to
+        impossible UI protocol states.
+        """
+        mask = [True] * self.n_actions
+        if not self.menu_open:
+            for i, (name, _keys) in enumerate(self.spec):
+                if name.startswith("pick") and name[-1].isdigit():
+                    mask[i] = False
+            return mask
+
+        usable = [(ltr, desc) for ltr, desc in RE_ITEM_LINE.findall(self.c.text())
+                  if not RE_IN_USE.search(desc)]
+        for i, (name, _keys) in enumerate(self.spec):
+            if name == "escape":
+                mask[i] = True       # explicit, safe "decline this menu"
+            elif name.startswith("pick") and name[-1].isdigit():
+                mask[i] = int(name[-1]) <= len(usable)
+            else:
+                mask[i] = False
+        # A malformed menu must never produce an all-false categorical
+        # distribution. Escape is the safe recovery action.
+        return mask
+
     def close(self):
         if self.c:
             self.c.close()
@@ -828,7 +887,7 @@ class DCSSEnv:
         self.menu_open = None
         return desc, True
 
-    def _close_menu(self):
+    def _close_menu(self, abandoned=True):
         """Escape a menu the agent left open by doing something else.
 
         Counted: opening a menu and then walking away from it is the whole cost
@@ -837,7 +896,8 @@ class DCSSEnv:
         variant b collapsed into.
         """
         if self.menu_open:
-            self.menu_abandoned += 1
+            if abandoned:
+                self.menu_abandoned += 1
             self.c.send("\x1b")
             self.c.drain(quiet=0.1, timeout=3)
             self.menu_open = None
@@ -851,20 +911,29 @@ class DCSSEnv:
         chose = None                      # description the agent committed to
         bad_pick = False
         name, keys = self.spec[action]
+        is_menu_pick = name.startswith("pick") and name[-1].isdigit()
 
-        # Anything that is not a pick abandons an open menu. Escaping first
-        # keeps the keystroke from being eaten by the menu, which is how the
-        # agent used to "blunder into" a list it could not see.
-        if not name.startswith("pick"):
-            self._close_menu()
+        # A menu is a separate decision phase.  `escape` is an explicit,
+        # legal decline; any other non-pick action is a protocol violation and
+        # is only reachable from an old checkpoint or an external caller that
+        # ignored action_mask().
+        cancelled_menu = False
+        if self.menu_open:
+            if name == "escape":
+                self._close_menu(abandoned=False)
+                cancelled_menu = True
+            elif not is_menu_pick:
+                self._close_menu(abandoned=True)
 
-        if name == "travel":
+        if cancelled_menu:
+            pass
+        elif name == "travel":
             self._travel()
         elif name == "pickup":
             self._pickup()
         elif name.startswith("open_"):
             self._open_menu(name.split("_", 1)[1])
-        elif name.startswith("pick"):
+        elif is_menu_pick:
             chose, ok = self._pick(int(name[-1]))
             if not ok:
                 bad_pick = True           # picked from a menu that wasn't there
@@ -1234,5 +1303,6 @@ class DCSSEnv:
                 "equip_refused": self.equip_refused,
                 "berserks": self.berserks, "berserk_wasted": self.berserk_wasted,
                 "hits": self.hits, "kills": self.kills,
-                "nonsense": self.nonsense, "ascents": self.ascents}
+                "nonsense": self.nonsense, "ascents": self.ascents,
+                "action_mask": self.action_mask()}
         return scr, reward, done, info

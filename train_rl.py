@@ -124,6 +124,24 @@ def encode(screen_text):
 OBS_LEN = CROP * CROP + SCREEN_CHARS
 
 
+def apply_action_mask(logits, mask):
+    """Remove impossible UI actions without changing scores among legal ones.
+
+    ``mask`` is part of the observation contract, not a reward trick.  PPO must
+    use the same mask when collecting *and* optimizing a transition; otherwise
+    the stored log probability and the updated distribution describe different
+    action spaces.
+    """
+    if mask is None:
+        return logits
+    mask = mask.to(device=logits.device, dtype=torch.bool)
+    if mask.ndim == 1:
+        mask = mask.unsqueeze(0)
+    if not torch.all(mask.any(dim=-1)):
+        raise ValueError("action mask contains a state with no legal action")
+    return logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+
+
 class Policy(nn.Module):
     """Shared trunk, separate actor and critic heads."""
 
@@ -161,13 +179,14 @@ class Policy(nn.Module):
         h = self.enc(self._tokens(x)).mean(1)
         return self.actor(h), self.critic(h).squeeze(-1)
 
-    def act(self, x):
+    def act(self, x, action_mask=None):
         logits, v = self(x)
-        dist = torch.distributions.Categorical(logits=logits)
+        dist = torch.distributions.Categorical(
+            logits=apply_action_mask(logits, action_mask))
         a = dist.sample()
         return a, dist.log_prob(a), dist.entropy(), v
 
-    def explain(self, x):
+    def explain(self, x, action_mask=None):
         """What the network computed for this screen, for the replay viewer.
 
         Returns per-action probabilities, the value estimate, and the encoder's
@@ -181,7 +200,7 @@ class Policy(nn.Module):
         """
         h = self.enc(self._tokens(x))         # B, P, D
         pooled = h.mean(1)
-        logits = self.actor(pooled)
+        logits = apply_action_mask(self.actor(pooled), action_mask)
         v = self.critic(pooled).squeeze(-1)
         sal = h.norm(dim=-1)                  # B, P
         sal = sal / sal.amax(dim=1, keepdim=True).clamp(min=1e-6)
@@ -382,19 +401,24 @@ def main():
     total_steps = 0
 
     for update in range(1, args.updates + 1):
-        buf_obs, buf_act, buf_logp, buf_val, buf_rew, buf_done = [], [], [], [], [], []
+        buf_obs, buf_act, buf_logp, buf_val, buf_rew, buf_done, buf_mask = \
+            [], [], [], [], [], [], []
         acts_taken = Counter()
 
         for _ in range(args.rollout):
             x = torch.stack([encode(o) for o in obs])
+            # Read the mask before acting: it describes the same observation
+            # whose log probability is stored in this PPO transition.
+            action_mask = torch.tensor([e.action_mask() for e in envs],
+                                       dtype=torch.bool)
             with torch.no_grad():
                 xd = x.to(device)
-                a, logp, _, v = policy.act(xd)
+                a, logp, _, v = policy.act(xd, action_mask.to(device))
                 a, logp, v = a.cpu(), logp.cpu(), v.cpu()
                 # What the net computed for this exact decision, saved with the
                 # frame so the replay viewer needs no inference of its own.
                 if rec.enabled:
-                    ex_p, ex_v, ex_s = policy.explain(xd)
+                    ex_p, ex_v, ex_s = policy.explain(xd, action_mask.to(device))
                     ex_p, ex_v, ex_s = ex_p.cpu(), ex_v.cpu(), ex_s.cpu()
                 else:
                     ex_p = ex_v = ex_s = None
@@ -432,6 +456,7 @@ def main():
             buf_val.append(v)
             buf_rew.append(torch.tensor(rews, dtype=torch.float32))
             buf_done.append(torch.tensor(dones, dtype=torch.float32))
+            buf_mask.append(action_mask)
             obs = next_obs
             cols = next_cols
             total_steps += args.envs
@@ -458,6 +483,7 @@ def main():
         b_obs = torch.cat(buf_obs)
         b_act = torch.cat(buf_act)
         b_logp = torch.cat(buf_logp)
+        b_mask = torch.cat(buf_mask)
         b_adv = adv.reshape(-1)
         b_ret = ret.reshape(-1)
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
@@ -472,8 +498,10 @@ def main():
                 mb_obs = b_obs[mb].to(device)
                 mb_act, mb_logp = b_act[mb].to(device), b_logp[mb].to(device)
                 mb_adv, mb_ret = b_adv[mb].to(device), b_ret[mb].to(device)
+                mb_mask = b_mask[mb].to(device)
                 logits, v = policy(mb_obs)
-                dist = torch.distributions.Categorical(logits=logits)
+                dist = torch.distributions.Categorical(
+                    logits=apply_action_mask(logits, mb_mask))
                 logp = dist.log_prob(mb_act)
                 ratio = (logp - mb_logp).exp()
                 a1 = ratio * mb_adv
