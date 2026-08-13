@@ -77,6 +77,7 @@ rolls.
 ```text
 # Fast deterministic curriculum: enemy recognition, recovery, and equipment.
 /root/pty-venv/bin/python train_gym.py --variant b
+/root/pty-venv/bin/python gym_eval.py --checkpoint data/gym_policy.b.pt --variant b --min-score 0.95
 
 # Run the real Crawl adapter against the versioned native Sprint map.
 /root/pty-venv/bin/python native_gym.py --install --smoke
@@ -89,8 +90,11 @@ rolls.
 # browse http://127.0.0.1:8101
 ```
 
-For a PPO run, pass the Gym checkpoint as `data/rl_policy.b.pt` (or rename it)
-and start `train_rl.py --variant b --resume --reset-heads`. This retains the
+Gym checkpoints (`data/gym_policy.<variant>.pt`) are deliberately separate
+from PPO checkpoints (`data/rl_policy.<variant>.pt`): real-game fine-tuning is
+allowed to change behaviour without erasing the curriculum evidence. To warm
+start PPO, copy the chosen Gym checkpoint to the PPO checkpoint path, then
+start `train_rl.py --variant b --resume --reset-heads`. This retains the
 Gym-trained visual/menu encoder but begins real Crawl with exploratory action
 and value heads. Gym mastery only confirms the interface and basic
 preferences; held-out real-game seeds remain the metric.
