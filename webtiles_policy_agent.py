@@ -25,7 +25,7 @@ import websockets
 
 from attic.teacher_agent import View, decode, send_key
 from dcss_env import RE_NO_TARGET, VARIANTS
-from train_rl import Policy, encode
+from train_rl import Policy, encode, load_policy_state
 
 
 HERE = Path(__file__).parent
@@ -54,6 +54,7 @@ class PolicyView(View):
         super().__init__()
         self.hostiles = set()
         self.terrain = {}
+        self.monster_attitudes = {}
 
     def apply_map(self, message):
         if message.get("clear"):
@@ -68,8 +69,14 @@ class PolicyView(View):
             if "mon" in cell:
                 self.hostiles.discard((cx, cy))
                 monster = cell.get("mon")
-                if monster and monster.get("att") == 0:
-                    self.hostiles.add((cx, cy))
+                if monster:
+                    monster_id = monster.get("id")
+                    if monster_id is not None and "att" in monster:
+                        self.monster_attitudes[monster_id] = monster["att"]
+                    attitude = monster.get(
+                        "att", self.monster_attitudes.get(monster_id))
+                    if attitude == 0:
+                        self.hostiles.add((cx, cy))
             elif "g" in cell:
                 # A foreground glyph explicitly replaces the old foreground.
                 # Letter glyphs are monsters; metadata is normally present,
@@ -149,14 +156,24 @@ async def neural_key(ws, name, view, macro_delay=0.35):
         # only when its menu packet arrives; fixed sleeps are unreliable under
         # parallel WebTiles load.
         await send_key(ws, "a")
+    elif name == "wait":
+        await send_key(ws, ".")
+    elif name.startswith("move_"):
+        keys = {
+            "move_n": "k", "move_ne": "u", "move_e": "l",
+            "move_se": "n", "move_s": "j", "move_sw": "b",
+            "move_w": "h", "move_nw": "y",
+        }
+        await send_key(ws, keys[name])
     else:
         raise ValueError(f"unsupported neural action: {name}")
 
 
-def choose(model, screen, deterministic, action_mask=None):
+def choose(model, screen, deterministic, action_mask=None, hostile_cells=None):
     """Return a neural action plus its complete probability distribution."""
     with torch.no_grad():
-        logits, value = model(encode(screen).unsqueeze(0))
+        logits, value = model(
+            encode(screen, hostile_cells=hostile_cells).unsqueeze(0))
         if action_mask is not None:
             legal = torch.tensor(action_mask, dtype=torch.bool,
                                  device=logits.device)
@@ -217,7 +234,7 @@ def visible_action_mask(names, view, signature, rejected_at):
     return mask, masked
 
 
-def choose_context(model, screen, choices, deterministic):
+def choose_context(model, screen, choices, deterministic, hostile_cells=None):
     """Make a genuine neural choice in a contextual WebTiles prompt.
 
     The historical PPO has seven command-mode logits and no separate menu
@@ -227,7 +244,8 @@ def choose_context(model, screen, choices, deterministic):
     output.
     """
     with torch.no_grad():
-        logits, value = model(encode(screen).unsqueeze(0))
+        logits, value = model(
+            encode(screen, hostile_cells=hostile_cells).unsqueeze(0))
         full_probs = torch.softmax(logits[0], dim=-1)
         context_probs = torch.softmax(logits[0, :len(choices)], dim=-1)
         if deterministic:
@@ -274,6 +292,13 @@ def terminal_layout(view, messages):
     return "\n".join("".join(row) for row in lines)
 
 
+def terminal_hostiles(view):
+    """Translate exact player-visible WebTiles monster cells to terminal cells."""
+    px, py = view.pos()
+    return {(x - px + 20, y - py + 8) for x, y in view.hostiles
+            if -20 <= x - px < 20 and -8 <= y - py <= 8}
+
+
 async def run(args):
     if args.variant != "c":
         raise SystemExit("WebTiles neural runner currently supports variant c only")
@@ -286,7 +311,10 @@ async def run(args):
 
     names = [name for name, _key in VARIANTS[args.variant]]
     model = Policy(len(names))
-    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    report = load_policy_state(
+        model, torch.load(checkpoint, map_location="cpu"))
+    if report["expanded"] or report["skipped"]:
+        print(f"checkpoint migration: {report}", flush=True)
     model.eval()
     model_hash = digest(checkpoint)
 
@@ -309,6 +337,7 @@ async def run(args):
     last_rx = 0.0
     last_sent_at = 0.0
     last_decision_screen = None
+    last_action_signature = None
     recent_messages = []
     input_mode = None
     pending_context = None
@@ -564,7 +593,8 @@ async def run(args):
                     continue
                 choices = context["choices"]
                 choice, probs, context_probs, value = choose_context(
-                    model, screen, choices, args.deterministic)
+                    model, screen, choices, args.deterministic,
+                    hostile_cells=terminal_hostiles(view))
                 name, key = choices[choice]
                 decisions.append({
                     "t": sent, "action": name, "context": context["kind"],
@@ -633,7 +663,8 @@ async def run(args):
                            ("stat_intelligence", "I"),
                            ("stat_dexterity", "D"))
                 choice, probs, context_probs, value = choose_context(
-                    model, screen, choices, args.deterministic)
+                    model, screen, choices, args.deterministic,
+                    hostile_cells=terminal_hostiles(view))
                 name, key = choices[choice]
                 decisions.append({
                     "t": sent, "action": name, "context": "attribute_prompt",
@@ -668,12 +699,26 @@ async def run(args):
                 continue
             action_mask, masked_actions = visible_action_mask(
                 names, view, signature, rejected_at)
+            # A primitive action that leaves depth, turn, HP and position all
+            # unchanged was visibly rejected (normally a move into a wall).
+            # Scope the rejection to this exact observation so the policy can
+            # immediately choose another direction, while the same direction
+            # becomes legal again after any real progress.  This is an action
+            # mask derived from public outcome, not a scripted replacement.
+            prior_name = decisions[-1].get("action") if decisions else None
+            if (prior_name and last_action_signature == signature
+                    and (prior_name.startswith("move_")
+                         or prior_name == "wait")):
+                rejected_at[prior_name] = signature
+                action_mask, masked_actions = visible_action_mask(
+                    names, view, signature, rejected_at)
             if not any(action_mask):
                 outcome = "no legal neural action in visible state"
                 print(f"RESULT {outcome}", flush=True)
                 break
             action, probs, value = choose(
-                model, screen, args.deterministic, action_mask)
+                model, screen, args.deterministic, action_mask,
+                hostile_cells=terminal_hostiles(view))
             name = names[action]
             decisions.append({
                 "t": sent, "action": name, "action_index": action,
@@ -689,6 +734,7 @@ async def run(args):
                 }
                 macro_sent_at = loop.time()
             await neural_key(ws, name, view, args.macro_delay)
+            last_action_signature = signature
             sent += 1
             last_decision_screen = screen
             last_sent_at = loop.time()

@@ -93,6 +93,39 @@ def scenarios(variant="b") -> Iterable[GymScenario]:
         _observation(wounded, names, all_legal), "rest",
         "Low health with no visible enemy calls for recovery, not blind combat.")
 
+    if variant == "c":
+        # Autofight can visibly reject a target when pathing is blocked.  The
+        # expanded policy must then choose an actual direction instead of
+        # ending the episode or retrying the rejected macro.  All eight cases
+        # use only the rendered glyph and the same visible legality mask that
+        # the live adapter exposes.
+        movement = {
+            "move_n": (0, -1), "move_ne": (1, -1), "move_e": (1, 0),
+            "move_se": (1, 1), "move_s": (0, 1), "move_sw": (-1, 1),
+            "move_w": (-1, 0), "move_nw": (-1, -1),
+        }
+        movement_mask = [name in {*movement, "wait"} for name in names]
+        for action, (dx, dy) in movement.items():
+            lines = _base_lines(
+                monster="g   goblin",
+                message="You cannot reach the goblin from here.")
+            row = list(lines[2 + dy])
+            row[7 + dx] = "g"
+            lines[2 + dy] = "".join(row)
+            yield GymScenario(
+                f"approach_{action[5:]}", "directional recovery",
+                _observation(_screen(*lines), names, movement_mask), action,
+                "Move toward a visible hostile after the combat macro rejects it.")
+
+        wait_mask = [name.startswith("move_") or name == "wait"
+                     for name in names]
+        exhausted = _screen(*_base_lines(
+            message="You are exhausted. You feel yourself slow down."))
+        yield GymScenario(
+            "wait_out_exhaustion", "status recovery",
+            _observation(exhausted, names, wait_mask), "wait",
+            "Spend a turn safely when only a visible temporary status remains.")
+
     if variant != "b":
         return
 

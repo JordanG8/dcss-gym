@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from dcss_env import VARIANTS
 from dcss_gym import scenarios
-from train_rl import Policy, apply_action_mask, encode
+from train_rl import Policy, apply_action_mask, encode, load_policy_state
 
 
 HERE = Path(__file__).parent
@@ -50,6 +50,10 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", type=Path, default=None,
                     help="checkpoint path (default: data/gym_policy.<variant>.pt)")
+    ap.add_argument("--resume-from", type=Path,
+                    help="warm-start from an existing checkpoint")
+    ap.add_argument("--freeze-trunk", action="store_true",
+                    help="fine-tune only the semantic action head")
     args = ap.parse_args()
     if args.epochs < 1:
         ap.error("--epochs must be positive")
@@ -58,18 +62,45 @@ def main():
     names = tuple(name for name, _key in VARIANTS[args.variant])
     cases, x, mask, y = dataset(args.variant)
     model = Policy(len(names))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+    if args.resume_from:
+        report = load_policy_state(
+            model, torch.load(args.resume_from, map_location="cpu"))
+        print(f"warm-started from {args.resume_from}: {report}")
+    if args.freeze_trunk:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.actor.parameters():
+            parameter.requires_grad_(True)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr,
                                   weight_decay=0.0)
+    cached_features = None
+    if args.freeze_trunk:
+        # The visual trunk is immutable in this mode.  Computing the exact
+        # same transformer activations on every epoch made a tiny 12-example
+        # head fit take minutes under eight live evaluators; cache them once.
+        model.eval()
+        with torch.no_grad():
+            cached_features = model.enc(model._tokens(x)).mean(1)
     model.train()
     for epoch in range(args.epochs):
-        logits, _value = model(x)
+        if cached_features is None:
+            logits, _value = model(x)
+        else:
+            logits = model.actor(cached_features)
         loss = F.cross_entropy(apply_action_mask(logits, mask), y)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         if (epoch + 1) % 40 == 0 or epoch + 1 == args.epochs:
-            correct, total, _pred = score(model, x, mask, y)
+            if cached_features is None:
+                correct, total, _pred = score(model, x, mask, y)
+            else:
+                with torch.no_grad():
+                    pred = apply_action_mask(
+                        model.actor(cached_features), mask).argmax(-1)
+                correct, total = int((pred == y).sum()), len(y)
             print(f"epoch={epoch + 1:3d} loss={loss.item():.4f} gym={correct}/{total}")
 
     correct, total, pred = score(model, x, mask, y)

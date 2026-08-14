@@ -6,9 +6,10 @@ games. No teacher, no demonstrations, no imitation term anywhere in this file.
 
 Design notes that matter for reproducing this
 ---------------------------------------------
-* Observation is the raw 80x24 terminal screen as character ids. The policy is
-  never handed parsed state - no "depth=3" feature, no monster list. It reads
-  the same glyphs a human reads.
+* Observation is the raw 80x24 terminal screen as character ids, plus one
+  player-visible bit on map cells occupied by a hostile. It never receives
+  hidden state; the extra bit disambiguates monster glyphs from scenery in the
+  same way the visible monster list does for a human.
 * Actions are DCSS macro commands (see dcss_env.ACTIONS), which is what makes
   an episode ~200 decisions instead of ~10,000 keystrokes.
 * Rollouts are collected in threads because env.step is pure blocking I/O on a
@@ -56,7 +57,8 @@ def set_paths(v):
     ENVS = DATA / f"rl_envs.{v}.json"
     VIEW = DATA / f"rl_view.{v}.txt"
 
-VOCAB = 128          # ASCII; anything else is folded to '?'
+BASE_VOCAB = 128     # ASCII; anything else is folded to '?'
+VOCAB = 256          # second half = same glyph with visible-hostile bit set
 COLS, ROWS = 80, 24
 SCREEN_CHARS = COLS * ROWS
 CROP = 15            # egocentric window, odd so the player sits dead centre
@@ -89,14 +91,30 @@ def to_grid(screen_text):
         line = rows[r] if r < len(rows) else ""
         b = line.encode("ascii", "replace")[:COLS]
         ids = list(b) + [32] * (COLS - len(b))
-        out.append([c if c < VOCAB else 63 for c in ids])
+        out.append([c if c < BASE_VOCAB else 63 for c in ids])
     return torch.tensor(out, dtype=torch.long)
 
 
 AT = ord("@")
 
 
-def encode(screen_text):
+def visible_hostile_cells(screen_text):
+    """Conservative hostile overlay inferred from the visible terminal map.
+
+    In console Crawl, hostile positions are letter glyphs in the left dungeon
+    pane.  Menus are excluded by requiring a map-like amount of terrain.  The
+    WebTiles adapter supplies exact player-visible ``mon.att`` positions
+    instead, including monsters whose glyph is punctuation.
+    """
+    if sum(screen_text.count(c) for c in "#.") <= 60:
+        return set()
+    grid = screen_text.split("\n")
+    return {(x, y) for y, row in enumerate(grid[:17])
+            for x, char in enumerate(row[:37])
+            if char != "@" and char.isascii() and char.isalpha()}
+
+
+def encode(screen_text, hostile_cells=None):
     """-> LongTensor[CROP*CROP + ROWS*COLS]: an egocentric crop then the map.
 
     The crop is the important half. At full resolution, centred on the player,
@@ -105,6 +123,11 @@ def encode(screen_text):
     the global shape needed to navigate toward stairs.
     """
     g = to_grid(screen_text)
+    cells = (visible_hostile_cells(screen_text) if hostile_cells is None
+             else hostile_cells)
+    for x, y in cells:
+        if 0 <= x < COLS and 0 <= y < ROWS and g[y, x] < BASE_VOCAB:
+            g[y, x] += BASE_VOCAB
     # Find the player. Search only the map region: '@' also appears in prose
     # ("@ the Chopper") and in the status panel.
     region = g[:17, :37]
@@ -205,6 +228,42 @@ class Policy(nn.Module):
         sal = h.norm(dim=-1)                  # B, P
         sal = sal / sal.amax(dim=1, keepdim=True).clamp(min=1e-6)
         return torch.softmax(logits, -1), v, sal
+
+
+def load_policy_state(policy, state_dict):
+    """Load an older policy while preserving compatible learned behaviour.
+
+    Action rows are semantic and append-only: an old actor is copied into the
+    leading rows exactly.  The expanded hostile vocabulary begins as a copy of
+    the corresponding plain glyph embedding, so migration is behaviour-neutral
+    until PPO learns to use the new visible bit.
+    """
+    own = policy.state_dict()
+    loaded, expanded, skipped = [], [], []
+    for name, source in state_dict.items():
+        if name not in own:
+            skipped.append(name)
+            continue
+        target = own[name]
+        if source.shape == target.shape:
+            target.copy_(source)
+            loaded.append(name)
+        elif name in {"actor.weight", "actor.bias"} and source.shape[0] <= target.shape[0]:
+            target[:source.shape[0]].copy_(source)
+            # New actions start deliberately modest, but remain sampleable.
+            if name == "actor.bias":
+                target[source.shape[0]:].fill_(float(source.min()) - 1.5)
+            expanded.append(name)
+        elif name == "emb.weight" and source.shape[1:] == target.shape[1:] and source.shape[0] <= target.shape[0]:
+            target[:source.shape[0]].copy_(source)
+            remaining = target.shape[0] - source.shape[0]
+            if remaining:
+                target[source.shape[0]:].copy_(source[:remaining])
+            expanded.append(name)
+        else:
+            skipped.append(name)
+    policy.load_state_dict(own)
+    return {"loaded": loaded, "expanded": expanded, "skipped": skipped}
 
 
 class Recorder:
@@ -373,13 +432,10 @@ def main():
         src = CKPT if CKPT.exists() else DATA / "rl_policy.pt"
         if src.exists():
             sd = torch.load(src)
-            own = policy.state_dict()
-            keep = {k: v for k, v in sd.items()
-                    if k in own and own[k].shape == v.shape}
-            skipped = [k for k in sd if k not in keep]
-            policy.load_state_dict(keep, strict=False)
-            print(f"resumed from {src.name}: loaded {len(keep)} tensors, "
-                  f"reinitialised {skipped}")
+            report = load_policy_state(policy, sd)
+            print(f"resumed from {src.name}: loaded {len(report['loaded'])} "
+                  f"tensors, expanded {report['expanded']}, "
+                  f"reinitialised {report['skipped']}")
             if args.reset_heads:
                 # A tiny supervised curriculum can (correctly) become nearly
                 # certain about its six fixtures, yet be disastrously certain

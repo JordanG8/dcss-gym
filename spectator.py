@@ -73,7 +73,7 @@ def load_frames(data_root, replay_id):
 
 def app(data_root, webtiles_url):
     runtime = {"processes": {}, "logs": {}}
-    checkpoint = Path("/mnt/c/Users/jorda/dcss-research/data/rl_policy.c.pt")
+    checkpoint = Path("/mnt/c/Users/jorda/dcss-gym/data/rl_policy.c16.gym.pt")
 
     def external_policy_pids():
         """Adopt evaluators that survived a dashboard-only restart."""

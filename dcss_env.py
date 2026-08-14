@@ -72,6 +72,14 @@ BASE = [
     ("escape", "\x1b"),    # back out of whatever is on screen
     ("berserk", "aa"),     # Trog's Berserk via the ability menu
 ]
+# Primitive movement is intentionally available only to the scalable policy
+# (variant c).  The original seven macro rows stay first and in the same order
+# so their learned actor weights can be migrated exactly.
+MOBILITY = [
+    ("move_n", "k"), ("move_ne", "u"), ("move_e", "l"),
+    ("move_se", "n"), ("move_s", "j"), ("move_sw", "b"),
+    ("move_w", "h"), ("move_nw", "y"), ("wait", "."),
+]
 # `None` means the key sequence is computed at runtime by reading the prompt.
 PICKUP = ("pickup", None)      # scripted: `,` plus the multi-item menu
 
@@ -96,7 +104,7 @@ VARIANTS = {
     "a": BASE + [PICKUP, ("wear", None), ("wield", None)],
     "b": BASE + [PICKUP,
                  ("open_wear", None), ("open_wield", None)] + PICKS,
-    "c": BASE,
+    "c": BASE + MOBILITY,
 }
 
 # Default kept for callers that predate variants (smoke tests, tooling).
@@ -1017,7 +1025,8 @@ class DCSSEnv:
             nth = int(name[-1]) if name[-1].isdigit() else 1
             self._equip(kind, nth)
         else:
-            if name in {"autofight", "explore", "descend"}:
+            if (name in {"autofight", "explore", "descend"}
+                    or name.startswith("move_")):
                 # These commands may change levels or position. The next
                 # descend must be justified by a new successful travel.
                 self.on_down_stair = False
