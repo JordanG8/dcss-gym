@@ -24,6 +24,11 @@ DEFAULT_DATA = HERE / "data"
 POLICY_AGENTS = 8
 POLICY_USERS = tuple(f"midcai{i + 1}" for i in range(POLICY_AGENTS))
 
+
+def is_tunnel_request(headers):
+    """Cloudflare adds this only to requests arriving through its edge."""
+    return bool(headers.get("CF-Connecting-IP"))
+
 PAGE = r"""<!doctype html><meta charset="utf-8"><title>DCSS Spectator</title>
 <style>
 :root{color-scheme:dark;--ink:#d9ddd5;--muted:#92a098;--edge:#29362e;--pane:#101713;--accent:#9fd36b;--hot:#f4c66a}*{box-sizing:border-box}body{margin:0;background:#080d0a;color:var(--ink);font:14px system-ui,sans-serif}header{height:56px;display:flex;align-items:center;gap:14px;padding:0 22px;border-bottom:1px solid var(--edge);background:#101713}h1{margin:0;font-size:17px;letter-spacing:.4px}h1 b{color:var(--accent)}button,select,input{background:#18231d;color:var(--ink);border:1px solid #35473b;border-radius:6px;padding:7px 10px}button:hover{border-color:var(--accent);cursor:pointer}.wrap{display:grid;grid-template-columns:minmax(560px,1fr) 340px;gap:14px;padding:14px;max-width:1700px;margin:auto}.pane{border:1px solid var(--edge);border-radius:10px;background:var(--pane);overflow:hidden}.bar{padding:10px 12px;border-bottom:1px solid var(--edge);display:flex;gap:8px;align-items:center;flex-wrap:wrap}.bar .spacer{flex:1}.live{width:100%;height:calc(100vh - 160px);min-height:610px;border:0;background:#000}.replay{display:none}.term{margin:0;padding:14px;background:#020403;min-height:576px;overflow:auto;font:15px/1.12 ui-monospace,Consolas,monospace;white-space:pre;letter-spacing:0}.term span{white-space:pre}.w{color:#d7ddd4}.r{color:#ec6b6b}.g{color:#83d17e}.y{color:#d6b565}.b{color:#80a6ef}.m{color:#d987d9}.c{color:#71d7d5}.k{color:#424d44}.W{color:#fff}.R{color:#ff8b8b}.G{color:#aafa96}.Y{color:#ffe08b}.B{color:#a7c5ff}.M{color:#f2a5f1}.C{color:#9af4ef}.side{padding:12px}.muted{color:var(--muted)}.game{width:100%;text-align:left;margin:4px 0}.game small{display:block;color:var(--muted);margin-top:2px}.action{color:var(--hot);font-weight:700}.prob{display:grid;grid-template-columns:78px 1fr 38px;gap:7px;align-items:center;margin:5px 0;font-size:12px}.track{height:7px;background:#26352c;border-radius:9px;overflow:hidden}.fill{height:100%;background:#81b857}.picked .fill{background:var(--hot)}#diag{margin-top:12px;border-top:1px solid var(--edge);padding-top:10px}@media(max-width:1000px){.wrap{grid-template-columns:1fr}.live{height:65vh}.side{max-height:40vh;overflow:auto}}
@@ -190,6 +195,14 @@ def app(data_root, webtiles_url):
             return self.send(404, "not found")
 
         def do_POST(self):
+            # Phone sharing is deliberately spectator-only. Localhost retains
+            # the start/stop and training controls, but a public quick-tunnel
+            # request can never mutate agent state even if someone discovers
+            # its temporary random hostname.
+            if is_tunnel_request(self.headers):
+                return self.send(
+                    403, json.dumps({"error": "remote dashboard is read-only"}),
+                    "application/json")
             u = urlparse(self.path)
             if u.path == "/api/policy/start":
                 if policy_status().get("running"):
