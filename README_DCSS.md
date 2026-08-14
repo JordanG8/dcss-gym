@@ -88,6 +88,11 @@ rolls.
 # Local viewing: authentic live WebTiles plus exact terminal-observation replay.
 /root/pty-venv/bin/python spectator.py --data-root data
 # browse http://127.0.0.1:8101
+
+# Genuine tiled replays: the official DCSS WebTiles renderer plays back a
+# recorded WebTiles map/player stream (new WebTiles-recorded runs only).
+/root/pty-venv/bin/python tile_replay.py
+# browse http://127.0.0.1:8102
 ```
 
 Gym checkpoints (`data/gym_policy.<variant>.pt`) are deliberately separate
@@ -98,3 +103,17 @@ start `train_rl.py --variant b --resume --reset-heads`. This retains the
 Gym-trained visual/menu encoder but begins real Crawl with exploratory action
 and value heads. Gym mastery only confirms the interface and basic
 preferences; held-out real-game seeds remain the metric.
+
+### Replay formats
+
+`spectator.py` replays fast headless PPO runs exactly as the policy saw them:
+the terminal grid, colours, selected action and probabilities. Those past logs
+do not contain tile IDs and cannot honestly gain tiles after the fact.
+
+For genuine tile replays, launch a watchable run with
+`attic/webtiles_agent.py --record-tiles`. It records the complete WebTiles
+protocol stream, then `tile_replay.py` feeds that stream into the official
+local DCSS WebTiles client and tile assets—no substitute tile renderer. The
+tile replay page starts on a settled map, supports turn-by-turn/playback, and
+lists each native recording. It requires the local WebTiles service on port
+8090 to be running.

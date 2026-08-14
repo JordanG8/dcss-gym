@@ -30,6 +30,7 @@ import websockets
 HERE = Path(__file__).parent
 GAMES = HERE / "games.jsonl"
 TRACES = HERE / "data" / "traces.jsonl"
+TILE_REPLAYS = HERE.parent / "data" / "webtiles_replays"
 
 URI = "ws://127.0.0.1:8090/socket"
 USER, PASSWORD = "midca", "midca"
@@ -126,6 +127,7 @@ async def run(args):
     ended = ""
     sent = 0
     traces = []
+    tile_events = []
     TRACES.parent.mkdir(parents=True, exist_ok=True)
     game_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -146,6 +148,11 @@ async def run(args):
 
             for m in msgs:
                 t = m.get("msg")
+                if args.record_tiles:
+                    # Keep the complete protocol sequence. The official
+                    # WebTiles client needs setup messages (not just map
+                    # deltas) before it can draw native tiles.
+                    tile_events.append({"t": sent, "data": m})
                 if t == "ping":
                     await ws.send(json.dumps({"msg": "pong"}))
                 elif t == "login_success":
@@ -213,6 +220,14 @@ async def run(args):
     }
     with open(GAMES, "a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
+    if args.record_tiles:
+        TILE_REPLAYS.mkdir(parents=True, exist_ok=True)
+        replay = TILE_REPLAYS / f"{game_id}.json"
+        replay.write_text(json.dumps({
+            "format": "dcss-webtiles-stream-v1", "game": game_id,
+            "events": tile_events,
+        }), encoding="utf-8")
+        print(f"saved native tile stream: {replay}", flush=True)
 
     print(f"done: {sent} keys, turn={row['turns']}, "
           f"{len(traces)} traces, {row['death']}", flush=True)
@@ -226,6 +241,8 @@ def main():
                     help="seconds between keys; higher is easier to watch")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--agent-name", default="webtiles-random")
+    ap.add_argument("--record-tiles", action="store_true",
+                    help="save raw WebTiles map/player messages for tiled replay")
     args = ap.parse_args()
     return asyncio.run(run(args))
 
