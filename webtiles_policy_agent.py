@@ -24,7 +24,7 @@ import torch
 import websockets
 
 from attic.teacher_agent import View, decode, send_key
-from dcss_env import VARIANTS
+from dcss_env import RE_NO_TARGET, VARIANTS
 from train_rl import Policy, encode
 
 
@@ -104,16 +104,30 @@ async def neural_key(ws, name, view):
         raise ValueError(f"unsupported neural action: {name}")
 
 
-def choose(model, screen, deterministic):
+def choose(model, screen, deterministic, action_mask=None):
     """Return a neural action plus its complete probability distribution."""
     with torch.no_grad():
         logits, value = model(encode(screen).unsqueeze(0))
+        if action_mask is not None:
+            legal = torch.tensor(action_mask, dtype=torch.bool,
+                                 device=logits.device)
+            if not bool(legal.any()):
+                raise ValueError("WebTiles action mask removed every action")
+            logits = logits.masked_fill(~legal.unsqueeze(0), -1e9)
         probs = torch.softmax(logits[0], dim=-1)
         if deterministic:
             action = int(probs.argmax())
         else:
             action = int(torch.multinomial(probs, 1))
     return action, [float(x) for x in probs], float(value[0])
+
+
+def visible_signature(view):
+    """Player-visible progress state used to scope a rejected-action mask."""
+    p = view.player
+    pos = p.get("pos") or {}
+    return (p.get("depth"), p.get("turn"), p.get("hp"),
+            pos.get("x"), pos.get("y"))
 
 
 def choose_context(model, screen, choices, deterministic):
@@ -212,6 +226,7 @@ async def run(args):
     started_at = time.time()
     last_progress_at = started_at
     progress_signature = None
+    autofight_rejected_at = None
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-neural-c"
 
     async with websockets.connect(URI, max_size=None, ping_interval=None) as ws:
@@ -287,6 +302,13 @@ async def run(args):
                     text = " ".join(x.get("text", "")
                                      for x in message.get("messages", []))
                     recent_messages = (recent_messages + [text])[-2:]
+                    if RE_NO_TARGET.search(text):
+                        # Crawl visibly rejected Tab. Keep it unavailable only
+                        # while the exact visible progress state is unchanged;
+                        # another action that moves, spends a turn, or changes
+                        # HP makes it eligible again. This prevents a frozen
+                        # no-target loop without injecting a tactical fallback.
+                        autofight_rejected_at = visible_signature(view)
                     if message.get("more"):
                         # This is the WebTiles protocol's explicit mandatory
                         # continuation flag. Enter is the only progression,
@@ -308,9 +330,7 @@ async def run(args):
                 break
 
             p = view.player
-            pos = p.get("pos") or {}
-            signature = (p.get("depth"), p.get("turn"), p.get("hp"),
-                         pos.get("x"), pos.get("y"))
+            signature = visible_signature(view)
             if signature != progress_signature:
                 progress_signature = signature
                 last_progress_at = time.time()
@@ -399,11 +419,19 @@ async def run(args):
             # truly ignored key while keeping each model decision auditable.
             if screen == last_decision_screen and loop.time() - last_sent_at < args.retry:
                 continue
-            action, probs, value = choose(model, screen, args.deterministic)
+            action_mask = [True] * len(names)
+            masked_actions = []
+            if signature == autofight_rejected_at:
+                autofight = names.index("autofight")
+                action_mask[autofight] = False
+                masked_actions.append("autofight")
+            action, probs, value = choose(
+                model, screen, args.deterministic, action_mask)
             name = names[action]
             decisions.append({
                 "t": sent, "action": name, "action_index": action,
                 "probabilities": probs, "value": value,
+                "masked_actions": masked_actions,
             })
             await neural_key(ws, name, view)
             sent += 1
