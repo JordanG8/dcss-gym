@@ -9,7 +9,7 @@ Why this is tractable on a laptop when raw-keystroke RL is not
 --------------------------------------------------------------
 The action space is DCSS's own MACRO commands, not movement keys. `o` is
 auto-explore: one decision, hundreds of game turns. `Tab` is a whole fight.
-`X > Enter` is travel across a level. So an episode that reaches D:5 is
+`X > .` is travel across a level. So an episode that reaches D:5 is
 ~100-200 decisions, not ~10,000 keystrokes. That is a small RL problem.
 
 What the env decides vs what the agent decides
@@ -533,6 +533,11 @@ class DCSSEnv:
         self.name = f"rl{variant}{env_id}"
         self.play_dir = PLAY_ROOT / self.name
         self.c = None
+        # Lifetime diagnostics survive episode resets, unlike ``nonsense``
+        # below.  This lets the trainer report an honest per-rollout rate
+        # instead of a raw sum that jumps backwards whenever an env resets.
+        self.nonsense_total = 0
+        self.nonsense_actions_total = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -580,6 +585,16 @@ class DCSSEnv:
         self.bad_choices = 0
         self.menu_open = None
         self.menu_abandoned = 0
+        # Public interaction history used only to remove commands that cannot
+        # currently succeed. A successful travel macro is what puts the player
+        # on a known down staircase; a declined equipment menu cannot change
+        # until an item enters or leaves the inventory.
+        self.on_down_stair = False
+        self.declined_menu_kinds = set()
+        # The first inspection of a particular equipment menu may correctly
+        # end in "take nothing". Reopening and declining the identical menu is
+        # a loop, not new information, and is charged as heavy nonsense.
+        self.last_declined_menu = None
         self.berserks = 0
         self.berserk_wasted = 0
         self.hits = 0
@@ -640,6 +655,34 @@ class DCSSEnv:
         """
         mask = [True] * self.n_actions
         if not self.menu_open:
+            scr = self.c.text()
+            # These are protocol/command legality constraints derived only
+            # from the same visible terminal observation given to the policy.
+            # Crawl rejects exploration and resting while a hostile is visible,
+            # and Tab has no target when none is visible. Escape on the normal
+            # dungeon map is likewise guaranteed to do nothing. Keeping these
+            # logits available taught the policy to spam a safe rejected key.
+            if self._map_like(scr):
+                hostile = self.monsters_visible(scr)
+                known_down = any(">" in line[:37]
+                                 for line in scr.splitlines()[:18])
+                declined = getattr(self, "declined_menu_kinds", set())
+                for i, (name, _keys) in enumerate(self.spec):
+                    if name == "autofight":
+                        mask[i] = hostile
+                    elif name in {"explore", "rest"}:
+                        mask[i] = not hostile
+                    elif name == "escape":
+                        mask[i] = False
+                    elif name == "travel":
+                        mask[i] = known_down and not getattr(
+                            self, "on_down_stair", False)
+                    elif name == "descend":
+                        mask[i] = getattr(self, "on_down_stair", False)
+                    elif name == "pickup":
+                        mask[i] = bool(RE_ITEM_HERE.search(scr))
+                    elif name.startswith("open_"):
+                        mask[i] = name.split("_", 1)[1] not in declined
             for i, (name, _keys) in enumerate(self.spec):
                 if name.startswith("pick") and name[-1].isdigit():
                     mask[i] = False
@@ -730,8 +773,8 @@ class DCSSEnv:
     def _travel(self):
         """Level map -> next down staircase -> travel there. Only if one exists.
 
-        This was a blind `X > Enter`. When no down staircase is known, `>` finds
-        nothing, the cursor stays put, and Enter auto-travels to whatever it was
+        This was a blind `X > .`. When no down staircase is known, `>` finds
+        nothing, the cursor stays put, and period auto-travels to whatever it was
         on — and DCSS auto-travel USES stairs, so the agent climbed back up and
         had to redo the level. Measured: 44 real depth regressions across 12
         episodes, every one preceded by a travel.
@@ -739,6 +782,7 @@ class DCSSEnv:
         Now the map's description line is checked for a downward feature before
         committing; otherwise back out, which costs a no-op instead of a level.
         """
+        self.on_down_stair = False
         self.c.send("X")
         self.c.drain(quiet=0.2, timeout=5)
         seen = set()
@@ -747,8 +791,18 @@ class DCSSEnv:
             self.c.drain(quiet=0.15, timeout=5)
             header = self.c.text().split("\n")[0].strip()
             if RE_DOWNSTAIR.search(header):
-                self.c.send("\r")
+                # The level-map footer explicitly advertises ``. - travel``.
+                # Enter merely leaves the cursor selected and can keep the map
+                # open, which made the next policy action operate in the wrong
+                # UI and generated a stream of false descends.
+                self.c.send(".")
                 self.c.drain()
+                arrived = self.c.text()
+                # Auto-travel can be interrupted by a newly visible monster.
+                # Only advertise descend when the map closed and the journey
+                # reached its quiet destination.
+                self.on_down_stair = (self._map_like(arrived)
+                                      and not self.monsters_visible(arrived))
                 return
             # `>` cycles through downward FEATURES, not just staircases — it
             # lands on transporters and hatches too. Keep cycling until a real
@@ -920,6 +974,7 @@ class DCSSEnv:
         prev_abandoned = self.menu_abandoned
         chose = None                      # description the agent committed to
         bad_pick = False
+        repeat_menu_cancel = False
         name, keys = self.spec[action]
         is_menu_pick = name.startswith("pick") and name[-1].isdigit()
 
@@ -930,7 +985,13 @@ class DCSSEnv:
         cancelled_menu = False
         if self.menu_open:
             if name == "escape":
+                declined_kind = self.menu_open
+                signature = tuple(RE_ITEM_LINE.findall(self.c.text()))
+                repeat_menu_cancel = bool(
+                    signature and signature == self.last_declined_menu)
+                self.last_declined_menu = signature or None
                 self._close_menu(abandoned=False)
+                self.declined_menu_kinds.add(declined_kind)
                 cancelled_menu = True
             elif not is_menu_pick:
                 self._close_menu(abandoned=True)
@@ -952,6 +1013,10 @@ class DCSSEnv:
             nth = int(name[-1]) if name[-1].isdigit() else 1
             self._equip(kind, nth)
         else:
+            if name in {"autofight", "explore", "descend"}:
+                # These commands may change levels or position. The next
+                # descend must be justified by a new successful travel.
+                self.on_down_stair = False
             self.c.send(keys)
             self.c.drain()
 
@@ -991,6 +1056,8 @@ class DCSSEnv:
         if RE_ITEM_HERE.search(scr_now):
             self._pickup()
             picked = picked or bool(RE_GOT.search(self.c.text()))
+        if picked or chose is not None:
+            self.declined_menu_kinds.clear()
         if self.variant == "c" and picked and self._map_like(self.c.text()):
             self._equip("wear")
             self._equip("wield")
@@ -1089,10 +1156,10 @@ class DCSSEnv:
         # all it measured. Here each penalty names a real error, and `rest`
         # beside a monster is punished even though it DOES consume turns.
         #
-        # Budget: at 30% nonsense over a 500-step episode this is 150 * 0.08 =
-        # -12, against +35 for reaching D:5. Depth still dominates ~3x. If the
-        # nonsense rate stops falling while depth stalls, this is the first
-        # number to cut.
+        # Budget: at 30% nonsense over the current 300-step episode this is
+        # 90 * 0.20 = -18, against +35 for reaching D:5. This is deliberately
+        # heavy enough to dominate local busywork without making a solve worth
+        # less than a merely quiet episode.
         msg_area = "\n".join(scr.split("\n")[17:])
         near = self.monsters_visible(scr)
         # NOT charged here, deliberately: `equip_refused`. Asking to wield when
@@ -1122,8 +1189,10 @@ class DCSSEnv:
             or RE_UNKNOWN.search(msg_area)
         )
         if nonsense:
-            reward -= 0.08
+            reward -= 0.20
             self.nonsense += 1
+            self.nonsense_total += 1
+            self.nonsense_actions_total[name] = self.nonsense_actions_total.get(name, 0) + 1
 
         # Equipment, scored by RESULT rather than by the attempt. The old
         # version paid +1.5 for the message "You are now wearing ...", which
@@ -1188,8 +1257,16 @@ class DCSSEnv:
         if bad_pick:
             # Committing to a slot with no menu open, or slot 3 of a two-item
             # list. Cheap — it is a protocol slip, not a bad judgement.
-            reward -= 0.08
+            reward -= 0.20
             self.nonsense += 1
+            self.nonsense_total += 1
+            self.nonsense_actions_total[name] = self.nonsense_actions_total.get(name, 0) + 1
+        if repeat_menu_cancel:
+            reward -= 0.20
+            self.nonsense += 1
+            self.nonsense_total += 1
+            self.nonsense_actions_total["repeat_menu_cancel"] = (
+                self.nonsense_actions_total.get("repeat_menu_cancel", 0) + 1)
         if self.menu_abandoned > prev_abandoned:
             # Opened a menu, then did something else. Priced at the nonsense
             # rate rather than higher: looking and declining is a LEGITIMATE
@@ -1197,8 +1274,11 @@ class DCSSEnv:
             # better — so this must stay cheap enough that checking is
             # affordable. It only has to beat free, because free is what turned
             # menu-opening into a hiding place.
-            reward -= 0.08
+            reward -= 0.20
             self.nonsense += 1
+            self.nonsense_total += 1
+            self.nonsense_actions_total["menu_abandoned"] = (
+                self.nonsense_actions_total.get("menu_abandoned", 0) + 1)
         if not ac_gain and not wpn_gain and name == "pickup" and RE_GOT.search(scr):
             reward += 0.3
 
@@ -1314,5 +1394,7 @@ class DCSSEnv:
                 "berserks": self.berserks, "berserk_wasted": self.berserk_wasted,
                 "hits": self.hits, "kills": self.kills,
                 "nonsense": self.nonsense, "ascents": self.ascents,
+                "nonsense_total": self.nonsense_total,
+                "nonsense_actions": dict(self.nonsense_actions_total),
                 "action_mask": self.action_mask()}
         return scr, reward, done, info

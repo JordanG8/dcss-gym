@@ -412,6 +412,8 @@ def main():
     ep_returns, ep_depths, ep_outcomes = deque(maxlen=60), deque(maxlen=60), deque(maxlen=60)
     running = [0.0] * args.envs
     t_start = time.time()
+    previous_nonsense_total = 0
+    previous_nonsense_actions = Counter()
     total_steps = 0
 
     for update in range(1, args.updates + 1):
@@ -538,10 +540,22 @@ def main():
         solved = sum(1 for d in ep_depths if d >= args.target_depth) / max(1, n_ep)
         el_s = time.time() - t_start
         top = ", ".join(f"{k}:{v}" for k, v in acts_taken.most_common(3))
+        nonsense_total = sum(e.nonsense_total for e in envs)
+        nonsense_actions_total = Counter()
+        for e in envs:
+            nonsense_actions_total.update(e.nonsense_actions_total)
+        nonsense_this = nonsense_total - previous_nonsense_total
+        nonsense_actions_this = nonsense_actions_total - previous_nonsense_actions
+        previous_nonsense_total = nonsense_total
+        previous_nonsense_actions = nonsense_actions_total.copy()
+        nonsense_top = ", ".join(
+            f"{k}:{v}" for k, v in nonsense_actions_this.most_common(3)) or "none"
         print(f"u{update:04d} steps={total_steps} {total_steps/el_s:.1f}/s | "
               f"ret={mean_ret:+.2f} depth={mean_depth:.2f} best=D:{best} "
               f"D{args.target_depth}={solved*100:.0f}% | "
-              f"ent={el:.3f} vloss={vl:.3f} | {top}", flush=True)
+              f"ent={el:.3f} vloss={vl:.3f} | {top} | "
+              f"nonsense={nonsense_this}/{args.envs * args.rollout} "
+              f"({nonsense_top})", flush=True)
 
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -585,6 +599,9 @@ def main():
                 # The number to watch: if nonsense does not fall, the penalty
                 # is not teaching anything and should be cut rather than raised.
                 "nonsense": sum(e.nonsense for e in envs),
+                "nonsense_rollout": nonsense_this,
+                "nonsense_rate": round(nonsense_this / (args.envs * args.rollout), 4),
+                "nonsense_actions": dict(nonsense_actions_this),
                 "ascents": sum(e.ascents for e in envs),
                 "travel_refused": sum(e.travel_refused for e in envs),
                 "berserks": sum(e.berserks for e in envs),

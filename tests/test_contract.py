@@ -37,6 +37,87 @@ class ContractTests(unittest.TestCase):
             is_menu_pick = name.startswith("pick") and name[-1].isdigit()
             self.assertEqual(mask[i], not is_menu_pick)
 
+    def test_visible_combat_masks_rejected_safe_commands(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        lines = ["#" * 40 + " " * 40 for _ in range(24)]
+        # The public monster list is the source used by monsters_visible().
+        lines[13] = " " * 37 + "g   goblin" + " " * 32
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertTrue(legal["autofight"])
+        self.assertTrue(legal["berserk"])
+        self.assertFalse(legal["explore"])
+        self.assertFalse(legal["rest"])
+        self.assertFalse(legal["escape"])
+
+    def test_visible_safety_masks_targetless_autofight(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        env.c = _Screen("\n".join("#" * 40 + " " * 40 for _ in range(24)))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["autofight"])
+        self.assertTrue(legal["explore"])
+        self.assertTrue(legal["rest"])
+        self.assertFalse(legal["escape"])
+
+    def test_travel_and_descend_require_visible_progress(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        env.declined_menu_kinds = set()
+        env.on_down_stair = False
+        lines = ["#" * 40 + " " * 40 for _ in range(24)]
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["travel"])
+        self.assertFalse(legal["descend"])
+
+        lines[5] = "#####>" + "#" * 34 + " " * 40
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertTrue(legal["travel"])
+        self.assertFalse(legal["descend"])
+
+        env.on_down_stair = True
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["travel"])
+        self.assertTrue(legal["descend"])
+
+    def test_declined_menu_is_masked_until_inventory_changes(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        env.on_down_stair = False
+        env.declined_menu_kinds = {"wear"}
+        env.c = _Screen("\n".join("#" * 40 + " " * 40 for _ in range(24)))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["open_wear"])
+        self.assertTrue(legal["open_wield"])
+
+    def test_pickup_requires_player_visible_loot(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        env.on_down_stair = False
+        env.declined_menu_kinds = set()
+        lines = ["#" * 40 + " " * 40 for _ in range(24)]
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["pickup"])
+
+        lines[18] = "You see here a leather armour."
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertTrue(legal["pickup"])
+
     def test_menu_allows_only_existing_choices_or_cancel(self):
         env = object.__new__(DCSSEnv)
         env.spec = VARIANTS["b"]
