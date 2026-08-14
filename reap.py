@@ -30,7 +30,12 @@ def crawl_procs():
             continue
 
 
-OWNERS = ("train_rl.py", "pty_agent.py", "webtiles_agent.py")
+OWNERS = ("train_rl.py", "train_r2d2.py", "train_async_r2d2.py", "pty_agent.py",
+          "webtiles_agent.py", "webserver/server.py")
+
+
+def is_owner_command(command):
+    return any(owner in command for owner in OWNERS)
 
 
 def cmdline(pid):
@@ -48,7 +53,7 @@ def main():
 
     procs = list(crawl_procs())
     orphans = [pid for pid, ppid in procs
-               if not any(o in cmdline(ppid) for o in OWNERS)]
+               if not is_owner_command(cmdline(ppid))]
     print(f"crawl processes: {len(procs)}   orphaned: {len(orphans)}")
     if not args.kill or not orphans:
         return

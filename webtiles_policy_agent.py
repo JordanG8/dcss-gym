@@ -24,7 +24,9 @@ import torch
 import websockets
 
 from attic.teacher_agent import View, decode, send_key
+from checkpointing import read_manifest
 from dcss_env import RE_NO_TARGET, VARIANTS
+from r2d2 import RecurrentQ
 from train_rl import Policy, encode, load_policy_state
 
 
@@ -45,6 +47,9 @@ RE_DOWN_FEATURE = re.compile(
     r"stairs.*leading down", re.I)
 RE_AUTOFIGHT_BLOCKED = re.compile(
     r"caught in a web|held in a net|cannot attack while held", re.I)
+RE_ABSENT_TARGET = re.compile(
+    r"No target in view|No monsters in view", re.I)
+RE_UNREACHABLE_TARGET = re.compile(r"No reachable target", re.I)
 
 
 class PolicyView(View):
@@ -53,12 +58,21 @@ class PolicyView(View):
     def __init__(self):
         super().__init__()
         self.hostiles = set()
+        self.hostile_ids = {}
+        self.hostile_revision = 0
+        self.hostile_appearance_revision = 0
         self.terrain = {}
         self.monster_attitudes = {}
 
     def apply_map(self, message):
+        before = (frozenset(self.hostiles),
+                  frozenset(self.hostile_ids.items()))
+        before_confirmed_ids = {
+            monster_id for monster_id in self.hostile_ids.values()
+            if monster_id is not None}
         if message.get("clear"):
             self.hostiles.clear()
+            self.hostile_ids.clear()
             self.terrain.clear()
         cleared_glyphs = set()
         cx = cy = 0
@@ -71,6 +85,7 @@ class PolicyView(View):
             monster = cell.get("mon") if has_mon else None
             if has_mon:
                 self.hostiles.discard((cx, cy))
+                self.hostile_ids.pop((cx, cy), None)
                 if monster:
                     monster_id = monster.get("id")
                     if monster_id is not None and "att" in monster:
@@ -79,6 +94,7 @@ class PolicyView(View):
                         "att", self.monster_attitudes.get(monster_id))
                     if attitude == 0:
                         self.hostiles.add((cx, cy))
+                        self.hostile_ids[(cx, cy)] = monster_id
                 else:
                     # An explicit null monster delta means the foreground
                     # monster left this square. Some compact packets omit g=""
@@ -95,8 +111,10 @@ class PolicyView(View):
                     cleared_glyphs.add((cx, cy))
                 if not has_mon:
                     self.hostiles.discard((cx, cy))
+                    self.hostile_ids.pop((cx, cy), None)
                     if glyph != "@" and re.fullmatch(r"[A-Za-z]", glyph):
                         self.hostiles.add((cx, cy))
+                        self.hostile_ids[(cx, cy)] = None
             glyph = cell.get("g")
             if (glyph is not None and glyph != "@"
                     and not re.fullmatch(r"[A-Za-z]", glyph)):
@@ -110,6 +128,23 @@ class PolicyView(View):
         for position in cleared_glyphs:
             self.grid.pop(position, None)
             self.terrain.pop(position, None)
+            self.hostile_ids.pop(position, None)
+        after = (frozenset(self.hostiles),
+                 frozenset(self.hostile_ids.items()))
+        after_confirmed_ids = {
+            monster_id for monster_id in self.hostile_ids.values()
+            if monster_id is not None}
+        if after_confirmed_ids - before_confirmed_ids:
+            self.hostile_appearance_revision += 1
+        if after != before:
+            self.hostile_revision += 1
+
+    def confirm_no_target(self):
+        """Trust Crawl's visible no-target response over remembered deltas."""
+        if self.hostiles or self.hostile_ids:
+            self.hostiles.clear()
+            self.hostile_ids.clear()
+            self.hostile_revision += 1
 
     def monsters_near(self, radius=8):
         px, py = self.pos()
@@ -189,11 +224,39 @@ async def neural_key(ws, name, view, macro_delay=0.35):
         raise ValueError(f"unsupported neural action: {name}")
 
 
+def model_logits(model, screen, action_mask=None, hostile_cells=None):
+    """Run either the historical spatial policy or recurrent Q policy."""
+    observation = encode(
+        screen, hostile_cells=hostile_cells).unsqueeze(0)
+    if isinstance(model, RecurrentQ):
+        hidden = getattr(model, "runtime_hidden", None)
+        if hidden is None:
+            hidden = model.initial_state(1, observation.device)
+        previous_action = torch.tensor(
+            [getattr(model, "runtime_previous_action", -1)],
+            dtype=torch.long, device=observation.device)
+        mask = (torch.tensor([action_mask], dtype=torch.bool)
+                if action_mask is not None else None)
+        logits, next_hidden = model.step(
+            observation, previous_action, hidden, mask)
+        value = logits.max(dim=-1).values
+        return logits, value, next_hidden
+    logits, value = model(observation)
+    return logits, value, None
+
+
+def commit_recurrent_state(model, next_hidden, action):
+    if isinstance(model, RecurrentQ):
+        model.runtime_hidden = next_hidden
+        model.runtime_previous_action = action
+
+
 def choose(model, screen, deterministic, action_mask=None, hostile_cells=None):
     """Return a neural action plus its complete probability distribution."""
     with torch.no_grad():
-        logits, value = model(
-            encode(screen, hostile_cells=hostile_cells).unsqueeze(0))
+        logits, value, next_hidden = model_logits(
+            model, screen, action_mask=action_mask,
+            hostile_cells=hostile_cells)
         if action_mask is not None:
             legal = torch.tensor(action_mask, dtype=torch.bool,
                                  device=logits.device)
@@ -205,6 +268,7 @@ def choose(model, screen, deterministic, action_mask=None, hostile_cells=None):
             action = int(probs.argmax())
         else:
             action = int(torch.multinomial(probs, 1))
+        commit_recurrent_state(model, next_hidden, action)
     return action, [float(x) for x in probs], float(value[0])
 
 
@@ -231,8 +295,13 @@ def visible_action_mask(names, view, signature, rejected_at):
     if not hostile_visible:
         rejected.add("berserk")
     rejected.add("escape")
-    rejected.update(name for name, rejected_signature in rejected_at.items()
-                    if signature == rejected_signature)
+    for name, rejected_token in rejected_at.items():
+        if (name == "autofight"
+                and rejected_token == (
+                    "hostile_appearance", view.hostile_appearance_revision)):
+            rejected.add(name)
+        elif signature == rejected_token:
+            rejected.add(name)
     on_down_stair = getattr(view, "terrain", {}).get(view.pos()) == ">"
     if not any(glyph == ">" for glyph in view.grid.values()):
         rejected.add("travel")
@@ -269,14 +338,15 @@ def choose_context(model, screen, choices, deterministic, hostile_cells=None):
     output.
     """
     with torch.no_grad():
-        logits, value = model(
-            encode(screen, hostile_cells=hostile_cells).unsqueeze(0))
+        logits, value, next_hidden = model_logits(
+            model, screen, hostile_cells=hostile_cells)
         full_probs = torch.softmax(logits[0], dim=-1)
         context_probs = torch.softmax(logits[0, :len(choices)], dim=-1)
         if deterministic:
             choice = int(context_probs.argmax())
         else:
             choice = int(torch.multinomial(context_probs, 1))
+        commit_recurrent_state(model, next_hidden, choice)
     return (choice, [float(x) for x in full_probs],
             [float(x) for x in context_probs], float(value[0]))
 
@@ -327,7 +397,12 @@ def terminal_hostiles(view):
 async def run(args):
     if args.variant != "c":
         raise SystemExit("WebTiles neural runner currently supports variant c only")
-    checkpoint = Path(args.checkpoint).resolve()
+    checkpoint_meta = {}
+    if args.checkpoint_manifest:
+        checkpoint_meta = read_manifest(args.checkpoint_manifest)
+        checkpoint = Path(checkpoint_meta["checkpoint"]).resolve()
+    else:
+        checkpoint = Path(args.checkpoint).resolve()
     if not checkpoint.is_file():
         raise SystemExit(f"checkpoint not found: {checkpoint}")
     if args.seed is not None:
@@ -335,11 +410,18 @@ async def run(args):
         torch.manual_seed(args.seed)
 
     names = [name for name, _key in VARIANTS[args.variant]]
-    model = Policy(len(names))
-    report = load_policy_state(
-        model, torch.load(checkpoint, map_location="cpu"))
-    if report["expanded"] or report["skipped"]:
-        print(f"checkpoint migration: {report}", flush=True)
+    architecture = checkpoint_meta.get("architecture", "spatial-v1")
+    state = torch.load(checkpoint, map_location="cpu")
+    if architecture == "r2d2-v1":
+        model = RecurrentQ(len(names))
+        model.load_state_dict(state)
+    elif architecture == "spatial-v1":
+        model = Policy(len(names))
+        report = load_policy_state(model, state)
+        if report["expanded"] or report["skipped"]:
+            print(f"checkpoint migration: {report}", flush=True)
+    else:
+        raise SystemExit(f"unsupported checkpoint architecture: {architecture}")
     model.eval()
     model_hash = digest(checkpoint)
 
@@ -555,8 +637,18 @@ async def run(args):
                             "t": sent, "kind": "neural_macro_completion",
                             "action": "travel", "key": ".",
                         })
-                    if (RE_NO_TARGET.search(text)
-                            or RE_AUTOFIGHT_BLOCKED.search(text)):
+                    if RE_ABSENT_TARGET.search(text):
+                        # An explicit "no target in view" result is stronger
+                        # evidence than a remembered glyph. Keep Tab masked
+                        # across movement until the visible hostile set itself
+                        # changes; otherwise a ghost target produces an
+                        # autofight/move/autofight loop forever.
+                        view.confirm_no_target()
+                        rejected_at["autofight"] = (
+                            "hostile_appearance",
+                            view.hostile_appearance_revision)
+                    elif (RE_UNREACHABLE_TARGET.search(text)
+                          or RE_AUTOFIGHT_BLOCKED.search(text)):
                         # Crawl visibly rejected Tab. Keep it unavailable only
                         # while the exact visible progress state is unchanged;
                         # another action that moves, spends a turn, or changes
@@ -601,6 +693,10 @@ async def run(args):
                 "value": last_decision.get("value"),
                 "masked_actions": last_decision.get("masked_actions", []),
                 "checkpoint_sha256": model_hash, "run": run_id,
+                "checkpoint_architecture": architecture,
+                "checkpoint_channel": checkpoint_meta.get("channel", "fixed"),
+                "checkpoint_update": checkpoint_meta.get("update", 0),
+                "checkpoint_published_at": checkpoint_meta.get("published_at"),
                 "attempt": args.attempt, "best_depth": args.best_depth,
                 "slot": args.slot, "username": args.username,
             })
@@ -775,10 +871,14 @@ async def run(args):
         "format": "dcss-webtiles-stream-v1",
         "game": run_id,
         "provenance": {
-            "agent": "neural-ppo", "variant": args.variant,
+            "agent": f"neural-{architecture}", "variant": args.variant,
             "slot": args.slot, "username": args.username,
             "selection": "argmax" if args.deterministic else "sample",
             "checkpoint": str(checkpoint), "checkpoint_sha256": model_hash,
+            "checkpoint_manifest": (str(args.checkpoint_manifest)
+                                    if args.checkpoint_manifest else None),
+            "checkpoint_channel": checkpoint_meta.get("channel", "fixed"),
+            "checkpoint_update": checkpoint_meta.get("update", 0),
             "action_names": names,
             "policy_input": "player-visible WebTiles glyph/status screen",
             "adapter_timing": {
@@ -808,6 +908,10 @@ async def run(args):
         "hp": p.get("hp", 0), "hp_max": p.get("hp_max", 0),
         "xl": p.get("xl", 1), "actions": sent, "run": run_id,
         "replay": replay.stem, "checkpoint_sha256": model_hash,
+        "checkpoint_architecture": architecture,
+        "checkpoint_channel": checkpoint_meta.get("channel", "fixed"),
+        "checkpoint_update": checkpoint_meta.get("update", 0),
+        "checkpoint_published_at": checkpoint_meta.get("published_at"),
         "attempt": args.attempt,
         "best_depth": max(args.best_depth, int(p.get("depth", 0) or 0)),
         "slot": args.slot, "username": args.username,
@@ -825,7 +929,9 @@ async def run(args):
 def main():
     global LIVE
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--checkpoint")
+    ap.add_argument("--checkpoint-manifest", type=Path,
+                    help="reload this atomic manifest between episodes")
     ap.add_argument("--variant", choices=["c"], default="c")
     ap.add_argument("--target-depth", type=int, default=5)
     ap.add_argument("--max-actions", type=int, default=1400)
@@ -852,12 +958,17 @@ def main():
     ap.add_argument("--register", action="store_true",
                     help="create the local WebTiles account if it is missing")
     ap.add_argument("--live-file", type=Path, default=LIVE)
+    ap.add_argument("--torch-threads", type=int, default=1,
+                    help="CPU inference threads for this spectator")
     args = ap.parse_args()
+    if not args.checkpoint and not args.checkpoint_manifest:
+        ap.error("one of --checkpoint or --checkpoint-manifest is required")
     if not 0 <= args.slot < 8:
         ap.error("--slot must be between 0 and 7")
     if not re.fullmatch(r"[A-Za-z0-9]+", args.username):
         ap.error("--username must contain only letters and digits")
     LIVE = args.live_file.resolve()
+    torch.set_num_threads(max(1, args.torch_threads))
     args.validation_deadline = time.time() + args.validation_minutes * 60
     args.attempt = 0
     args.best_depth = 0

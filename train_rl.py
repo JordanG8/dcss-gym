@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from checkpointing import atomic_torch_save, manifest_path, publish_manifest
 from dcss_env import VARIANTS, DCSSEnv
 
 HERE = Path(__file__).parent
@@ -198,8 +199,12 @@ class Policy(nn.Module):
         wide = self.pool(wide.transpose(1, 2)).transpose(1, 2)
         return torch.cat([crop, wide], 1) + self.pos
 
+    def features(self, x):
+        """Spatial state embedding shared by feed-forward and recurrent heads."""
+        return self.enc(self._tokens(x)).mean(1)
+
     def forward(self, x):
-        h = self.enc(self._tokens(x)).mean(1)
+        h = self.features(x)
         return self.actor(h), self.critic(h).squeeze(-1)
 
     def act(self, x, action_mask=None):
@@ -672,9 +677,25 @@ def main():
             }) + "\n")
 
         if update % 5 == 0:
-            torch.save(policy.state_dict(), CKPT)
+            atomic_torch_save(policy.state_dict(), CKPT)
+            publish_manifest(
+                CKPT, manifest_path(DATA, args.variant, "candidate"),
+                variant=args.variant, channel="candidate", update=update,
+                architecture="spatial-v1", action_names=action_names,
+                metrics={
+                    "episodes": n_ep, "mean_return": round(mean_ret, 3),
+                    "mean_depth": round(mean_depth, 3),
+                    "best_depth": best, "solve_rate": round(solved, 3),
+                    "nonsense_rate": round(
+                        nonsense_this / (args.envs * args.rollout), 4),
+                })
 
-    torch.save(policy.state_dict(), CKPT)
+    atomic_torch_save(policy.state_dict(), CKPT)
+    publish_manifest(
+        CKPT, manifest_path(DATA, args.variant, "candidate"),
+        variant=args.variant, channel="candidate", update=args.updates,
+        architecture="spatial-v1", action_names=action_names,
+        metrics={"complete": True})
     for e in envs:
         e.close()
 

@@ -4,10 +4,22 @@ import torch
 
 from dcss_env import BASE, MOBILITY, VARIANTS
 from train_rl import BASE_VOCAB, CROP, Policy, encode, load_policy_state
-from webtiles_policy_agent import PolicyView, visible_action_mask
+from r2d2 import RecurrentQ
+from webtiles_policy_agent import PolicyView, choose, visible_action_mask
 
 
 class PolicyInterfaceTests(unittest.TestCase):
+    def test_webtiles_recurrent_policy_carries_visible_history(self):
+        model = RecurrentQ(3)
+        screen = "\n".join([" " * 80 for _ in range(24)])
+        action, probabilities, _value = choose(
+            model, screen, deterministic=True,
+            action_mask=[True, False, True], hostile_cells=set())
+        self.assertIn(action, (0, 2))
+        self.assertEqual(probabilities[1], 0.0)
+        self.assertIsNotNone(model.runtime_hidden)
+        self.assertEqual(model.runtime_previous_action, action)
+
     def test_variant_c_appends_mobility_without_reordering_old_actions(self):
         self.assertEqual(VARIANTS["c"][:len(BASE)], BASE)
         self.assertEqual([name for name, _ in MOBILITY], [
@@ -84,6 +96,38 @@ class PolicyInterfaceTests(unittest.TestCase):
                                     "mon": {"id": 9, "att": 4}}]})
 
         self.assertEqual(view.monsters_near(), 0)
+
+    def test_no_target_mask_survives_movement_until_hostiles_change(self):
+        view = PolicyView()
+        view.player = {"pos": {"x": 5, "y": 5}, "hp": 10, "hp_max": 20}
+        view.apply_map({"cells": [{"x": 6, "y": 5, "g": "g",
+                                    "mon": {"id": 4, "att": 0}}]})
+        names = [name for name, _ in VARIANTS["c"]]
+        view.confirm_no_target()
+        rejected = {"autofight": (
+            "hostile_appearance", view.hostile_appearance_revision)}
+        moved_signature = (1, 10, 7, 5)
+        mask, _ = visible_action_mask(names, view, moved_signature, rejected)
+        self.assertFalse(mask[names.index("autofight")])
+
+        view.apply_map({"cells": [{"x": 8, "y": 5, "g": "r",
+                                    "mon": {"id": 8, "att": 0}}]})
+        mask, _ = visible_action_mask(names, view, moved_signature, rejected)
+        self.assertTrue(mask[names.index("autofight")])
+
+    def test_no_target_mask_ignores_unconfirmed_letter_churn(self):
+        view = PolicyView()
+        view.player = {"pos": {"x": 5, "y": 5}, "hp": 10, "hp_max": 20}
+        names = [name for name, _ in VARIANTS["c"]]
+        view.confirm_no_target()
+        rejected = {"autofight": (
+            "hostile_appearance", view.hostile_appearance_revision)}
+
+        view.apply_map({"cells": [{"x": 6, "y": 5, "g": "g"}]})
+        mask, _ = visible_action_mask(
+            names, view, (1, 11, 5, 5), rejected)
+
+        self.assertFalse(mask[names.index("autofight")])
 
     def test_mobility_prevents_all_false_visible_mask(self):
         view = PolicyView()

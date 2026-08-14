@@ -18,11 +18,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from checkpointing import manifest_path, publish_manifest
 
 HERE = Path(__file__).parent
 DEFAULT_DATA = HERE / "data"
-POLICY_AGENTS = 8
+POLICY_AGENTS = 2
 POLICY_USERS = tuple(f"midcai{i + 1}" for i in range(POLICY_AGENTS))
+POLICY_LANES = ("candidate", "champion")
 
 
 def is_tunnel_request(headers):
@@ -35,7 +37,7 @@ PAGE = r"""<!doctype html><meta charset="utf-8"><title>DCSS Spectator</title>
 .policy{padding:12px;margin:-2px -2px 14px;border:1px solid #35473b;border-radius:9px;background:#141f19}.policy h2{font-size:15px;margin:0 0 8px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:9px 0}.stat{background:#0b120e;border-radius:6px;padding:7px}.stat b{display:block;font-size:17px;color:var(--accent)}.badge{display:inline-block;border-radius:99px;padding:3px 8px;background:#29362e;color:var(--muted)}.badge.validating{color:var(--hot)}.badge.running{color:var(--accent)}.badge.failed{color:#ff8b8b}.buttons{display:flex;gap:7px}.buttons button{flex:1}.envs{padding:12px;margin:0 -2px 14px;border:1px solid #35473b;border-radius:9px;background:#0d1510}.envgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:9px 0}.envcell{padding:7px 5px;text-align:left}.envcell.on{border-color:var(--hot);box-shadow:0 0 0 1px var(--hot) inset}.envcell b,.envcell small{display:block}.envcell small{color:var(--muted);margin-top:3px}.hpbar{height:4px;background:#26352c;border-radius:4px;overflow:hidden;margin-top:5px}.hpbar i{display:block;height:100%;background:var(--accent)}.hpbar i.low{background:#ec6b6b}
 .probgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:3px 16px;margin-top:8px}#diag,#liveDiag{margin-top:0;padding:12px 14px;background:#0b120e;border-top:1px solid var(--edge)}.probgrid .prob{grid-template-columns:82px 1fr 38px;margin:4px 0}.policygrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:9px 0}.policycell{padding:7px 5px;text-align:left}.policycell.on{border-color:var(--hot);box-shadow:0 0 0 1px var(--hot) inset}.policycell b,.policycell small{display:block}.policycell small{color:var(--muted);margin-top:3px}
 </style><header><h1><b>DCSS</b> Spectator</h1><button id="live">Live WebTiles</button><button id="openLive">Open WebTiles</button><button id="tileReplay">Tile Replays</button><button id="replay">Replay Lab</button><span class="muted">player-visible replays · local-only director diagnostics</span></header>
-<main class="wrap"><section class="pane"><div class="bar"><b id="title">Live game — official WebTiles renderer</b><span class="spacer"></span><span id="playback"><button id="play">Play</button><label>speed <select id="speed"><option value="900">slow</option><option value="350" selected>normal</option><option value="100">fast</option></select></label></span></div><iframe id="webtiles" class="live"></iframe><div id="liveDiag"><span class="muted">Waiting for the selected neural agent's first decision…</span></div><div id="replayPane" class="replay"><pre id="term" class="term"></pre><input id="seek" type="range" min="0" value="0" style="width:100%"><div id="diag"></div></div></section><aside class="pane side"><div class="policy"><h2>Eight neural WebTiles agents</h2><span id="policyBadge" class="badge">offline</span><div id="policyGrid" class="policygrid"><span class="muted">loading…</span></div><div class="stats"><div class="stat"><b id="pd">—</b>depth</div><div class="stat"><b id="php">—</b>health</div><div class="stat"><b id="pt">—</b>turn</div></div><p id="policyText" class="muted">Ready for eight independent PPO WebTiles games.</p><div class="buttons"><button id="startPolicy">Start all 8</button><button id="stopPolicy">Stop all</button><button id="policyReplay">Tiles</button></div></div><div class="envs"><b>Variant B training</b><p class="muted">Stopped. This panel remains available for future training runs.</p><div id="envGrid" class="envgrid"><span class="muted">no B environments running</span></div><small id="envMeta" class="muted"></small></div><b>Recorded episodes</b><p class="muted">Live play is the authentic WebTiles page. Replays show exactly what the policy saw, including terminal colours and action probabilities.</p><div id="games"></div></aside></main>
+<main class="wrap"><section class="pane"><div class="bar"><b id="title">Live game — official WebTiles renderer</b><span class="spacer"></span><span id="playback"><button id="play">Play</button><label>speed <select id="speed"><option value="900">slow</option><option value="350" selected>normal</option><option value="100">fast</option></select></label></span></div><iframe id="webtiles" class="live"></iframe><div id="liveDiag"><span class="muted">Waiting for the selected neural agent's first decision…</span></div><div id="replayPane" class="replay"><pre id="term" class="term"></pre><input id="seek" type="range" min="0" value="0" style="width:100%"><div id="diag"></div></div></section><aside class="pane side"><div class="policy"><h2>Checkpoint WebTiles canaries</h2><span id="policyBadge" class="badge">offline</span><div id="policyGrid" class="policygrid"><span class="muted">loading…</span></div><div class="stats"><div class="stat"><b id="pd">—</b>depth</div><div class="stat"><b id="php">—</b>health</div><div class="stat"><b id="pt">—</b>turn</div></div><p id="policyText" class="muted">Candidate follows the latest atomic checkpoint; champion stays on the promoted best.</p><div class="buttons"><button id="startPolicy">Start canaries</button><button id="stopPolicy">Stop all</button><button id="policyReplay">Tiles</button></div></div><div class="envs"><b>Training environments</b><p class="muted">Headless actors feed the learner; select an environment when training is live.</p><div id="envGrid" class="envgrid"><span class="muted">no environments running</span></div><small id="envMeta" class="muted"></small></div><b>Recorded episodes</b><p class="muted">Live play is the authentic WebTiles page. Replays show exactly what the policy saw, including terminal colours and action probabilities.</p><div id="games"></div></aside></main>
 <script>
 const $=q=>document.querySelector(q);let frames=[],i=0,timer=null,mode='live',trainEnv=0,trainFrame=null,policySlot=0,policyAgents=[];
 function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -48,12 +50,12 @@ function stop(){if(timer){clearInterval(timer);timer=null}$('#play').textContent
 async function openReplay(id){frames=await (await fetch('/api/replay?id='+encodeURIComponent(id))).json();setMode('replay');$('#title').textContent=`Replay Lab — ${id}`;$('#seek').max=Math.max(0,frames.length-1);show(0);}
 function liveProbabilities(s){const names=s.action_names||[],ps=s.action_probabilities||[];if(!ps.length){$('#liveDiag').innerHTML='<span class="muted">Waiting for this neural agent’s first decision…</span>';return}const peak=Math.max(...ps,0.0001);$('#liveDiag').innerHTML=`<b>Agent ${s.slot+1} action probabilities</b><span class="muted"> · chose </span><span class="action">${esc(s.last_action||'?')}</span><div class="probgrid">${ps.map((p,n)=>`<div class="prob ${names[n]===s.last_action?'picked':''}"><span>${esc(names[n]||n)}</span><span class="track"><span class="fill" style="width:${Math.max(2,p/peak*100)}%"></span></span><span>${(p*100).toFixed(1)}%</span></div>`).join('')}</div>`;}
 function selectPolicy(slot){policySlot=slot;setMode('live');$('#webtiles').src=location.origin+'/live?slot='+slot;policyStatus();}
-async function policyStatus(){const all=await (await fetch('/api/policy/status',{cache:'no-store'})).json(),b=$('#policyBadge');policyAgents=all.agents||[];const s=policyAgents[policySlot]||{slot:policySlot,phase:'offline'};b.textContent=`${all.running_count||0}/8 ${all.phase||'offline'}`;b.className='badge '+(all.phase||'');$('#pd').textContent=s.depth?`D:${s.depth}`:'—';$('#php').textContent=s.hp_max?`${s.hp}/${s.hp_max}`:'—';$('#pt').textContent=s.turn??'—';const run=`attempt ${s.attempt||1} · best D:${s.best_depth||s.depth||1}`;let msg=s.outcome||s.last_action||'Ready for an independent PPO WebTiles run.';if(s.phase==='validating')msg=`10-minute live gate · ${s.validation_remaining_s}s · ${run} · ${s.actions||0} neural actions`;else if(s.phase==='running')msg=`Validation passed · ${run} · ${s.actions||0} neural actions · ${s.last_action||''}`;$('#policyText').textContent=`Agent ${policySlot+1} · ${msg}`;const grid=$('#policyGrid');grid.innerHTML=policyAgents.map(a=>`<button class="policycell ${a.slot===policySlot?'on':''}" data-slot="${a.slot}"><b>#${a.slot+1} · ${a.depth?'D:'+a.depth:a.phase||'offline'}</b><small>${a.running?'turn '+(a.turn||0):a.phase||'offline'}</small></button>`).join('');grid.querySelectorAll('.policycell').forEach(cell=>cell.onclick=()=>selectPolicy(+cell.dataset.slot));$('#startPolicy').disabled=!!all.running;$('#stopPolicy').disabled=!all.running;$('#policyReplay').disabled=!s.replay;$('#policyReplay').dataset.replay=s.replay||'';liveProbabilities(s);}
+async function policyStatus(){const all=await (await fetch('/api/policy/status',{cache:'no-store'})).json(),b=$('#policyBadge');policyAgents=all.agents||[];const s=policyAgents[policySlot]||{slot:policySlot,phase:'offline'};b.textContent=`${all.running_count||0}/${all.agent_count||2} ${all.phase||'offline'}`;b.className='badge '+(all.phase||'');$('#pd').textContent=s.depth?`D:${s.depth}`:'—';$('#php').textContent=s.hp_max?`${s.hp}/${s.hp_max}`:'—';$('#pt').textContent=s.turn??'—';const run=`attempt ${s.attempt||1} · best D:${s.best_depth||s.depth||1}`;const checkpoint=`${s.lane||'fixed'} · ${s.checkpoint_architecture||'unknown'} · update ${s.checkpoint_update||0} · ${(s.checkpoint_sha256||'').slice(0,8)}`;let msg=s.outcome||s.last_action||'Ready for a checkpoint canary run.';if(s.phase==='validating')msg=`10-minute live gate · ${s.validation_remaining_s}s · ${run} · ${s.actions||0} neural actions`;else if(s.phase==='running')msg=`Validation passed · ${run} · ${s.actions||0} neural actions · ${s.last_action||''}`;$('#policyText').textContent=`${checkpoint} · ${msg}`;const grid=$('#policyGrid');grid.innerHTML=policyAgents.map(a=>`<button class="policycell ${a.slot===policySlot?'on':''}" data-slot="${a.slot}"><b>${a.lane||'#'+(a.slot+1)} · ${a.depth?'D:'+a.depth:a.phase||'offline'}</b><small>${a.running?'turn '+(a.turn||0):a.phase||'offline'} · ${a.checkpoint_architecture||'?'} · u${a.checkpoint_update||0}</small></button>`).join('');grid.querySelectorAll('.policycell').forEach(cell=>cell.onclick=()=>selectPolicy(+cell.dataset.slot));$('#startPolicy').disabled=!!all.running;$('#stopPolicy').disabled=!all.running;$('#policyReplay').disabled=!s.replay;$('#policyReplay').dataset.replay=s.replay||'';liveProbabilities(s);}
 async function policyPost(path){await fetch(path,{method:'POST'});await policyStatus();}
-async function pollEnvs(){let list=[];try{list=await (await fetch('/api/training/envs?v=b',{cache:'no-store'})).json()}catch(e){}const g=$('#envGrid');if(!list.length){g.innerHTML='<span class="muted">no B environments running</span>';return}g.innerHTML=list.map(e=>{const hp=Math.round(100*(e.hp??1));return `<button class="envcell ${e.env===trainEnv?'on':''}" data-env="${e.env}"><b>#${e.env} · D:${e.depth}</b><small>XL ${e.xl} · turn ${e.turns}</small><span class="hpbar"><i class="${hp<40?'low':''}" style="width:${hp}%"></i></span></button>`}).join('');g.querySelectorAll('.envcell').forEach(b=>b.onclick=async()=>{trainEnv=+b.dataset.env;setMode('train');$('#envMeta').textContent=`switching to B / env ${trainEnv}…`;await fetch(`/api/training/watch?v=b&env=${trainEnv}`,{method:'POST'});pollEnvs();pollTraining()})}
-async function pollTraining(){if(mode!=='train')return;try{const f=await (await fetch('/api/training/live?v=b',{cache:'no-store'})).json();if(!f)return;if(f.env!==trainEnv){$('#envMeta').textContent=`switching to B / env ${trainEnv}…`;return}trainFrame=f;$('#envMeta').textContent=`B / env ${f.env} · step ${f.step} · ${f.action}`;$('#title').textContent=`Training B / env ${f.env} — exact policy observation`;paintCore(f,`Live B environment ${f.env} · step ${f.step}`)}catch(e){}}
+async function pollEnvs(){let list=[];try{list=await (await fetch('/api/training/envs?v=c',{cache:'no-store'})).json()}catch(e){}const g=$('#envGrid');if(!list.length){g.innerHTML='<span class="muted">no C environments running</span>';return}g.innerHTML=list.map(e=>{const hp=Math.round(100*(e.hp??1));return `<button class="envcell ${e.env===trainEnv?'on':''}" data-env="${e.env}"><b>#${e.env} · D:${e.depth}</b><small>XL ${e.xl} · turn ${e.turns}</small><span class="hpbar"><i class="${hp<40?'low':''}" style="width:${hp}%"></i></span></button>`}).join('');g.querySelectorAll('.envcell').forEach(b=>b.onclick=async()=>{trainEnv=+b.dataset.env;setMode('train');$('#envMeta').textContent=`switching to C / env ${trainEnv}…`;await fetch(`/api/training/watch?v=c&env=${trainEnv}`,{method:'POST'});pollEnvs();pollTraining()})}
+async function pollTraining(){if(mode!=='train')return;try{const f=await (await fetch('/api/training/live?v=c',{cache:'no-store'})).json();if(!f)return;if(f.env!==trainEnv){$('#envMeta').textContent=`switching to C / env ${trainEnv}…`;return}trainFrame=f;$('#envMeta').textContent=`C / env ${f.env} · step ${f.step} · ${f.action}`;$('#title').textContent=`Training C / env ${f.env} — exact recurrent policy observation`;paintCore(f,`Live C environment ${f.env} · step ${f.step}`)}catch(e){}}
 $('#webtiles').src=location.origin+'/live?slot=0';$('#live').onclick=()=>selectPolicy(policySlot);$('#openLive').onclick=()=>window.open(location.origin+'/live?slot='+policySlot,'_blank');$('#tileReplay').onclick=()=>window.open('http://127.0.0.1:8102','_blank');$('#replay').onclick=()=>setMode('replay');$('#play').onclick=toggle;$('#seek').oninput=e=>show(+e.target.value);loadGames();
-$('#startPolicy').onclick=()=>policyPost('/api/policy/start');$('#stopPolicy').onclick=()=>policyPost('/api/policy/stop');$('#policyReplay').onclick=e=>window.open('http://127.0.0.1:8102/?id='+encodeURIComponent(e.target.dataset.replay),'_blank');policyStatus();setInterval(policyStatus,1000);
+$('#startPolicy').onclick=()=>policyPost('/api/policy/start');$('#stopPolicy').onclick=()=>policyPost('/api/policy/stop');$('#policyReplay').onclick=e=>window.open('http://127.0.0.1:8102/?id='+encodeURIComponent(e.target.dataset.replay),'_blank');policyStatus();pollEnvs();pollTraining();setInterval(policyStatus,1000);setInterval(pollEnvs,1000);setInterval(pollTraining,500);
 </script>"""
 
 
@@ -79,6 +81,17 @@ def load_frames(data_root, replay_id):
 def app(data_root, webtiles_url):
     runtime = {"processes": {}, "logs": {}}
     checkpoint = Path("/mnt/c/Users/jorda/dcss-gym/data/rl_policy.c16.gym.pt")
+    for lane in POLICY_LANES:
+        lane_manifest = manifest_path(data_root, "c", lane)
+        if not lane_manifest.exists() and checkpoint.exists():
+            publish_manifest(
+                checkpoint, lane_manifest, variant="c", channel=lane,
+                architecture="spatial-v1",
+                action_names=("autofight", "explore", "rest", "descend",
+                              "travel", "escape", "berserk", "move_n",
+                              "move_ne", "move_e", "move_se", "move_s",
+                              "move_sw", "move_w", "move_nw", "wait"),
+                metrics={"bootstrap": "gym-certified"})
 
     def external_policy_pids():
         """Adopt evaluators that survived a dashboard-only restart."""
@@ -116,7 +129,7 @@ def app(data_root, webtiles_url):
                 status = {"phase": "offline"}
             status.update({
                 "running": running, "pid": pid, "slot": slot,
-                "username": username,
+                "username": username, "lane": POLICY_LANES[slot],
             })
             if (not running
                     and status.get("phase") in {"validating", "running"}):
@@ -126,6 +139,7 @@ def app(data_root, webtiles_url):
         active = [agent for agent in agents if agent["running"]]
         return {
             "agents": agents, "running": bool(active),
+            "agent_count": POLICY_AGENTS,
             "running_count": len(active),
             "phase": ("validating" if any(
                 agent.get("phase") == "validating" for agent in active)
@@ -211,17 +225,26 @@ def app(data_root, webtiles_url):
                 for slot, username in enumerate(POLICY_USERS):
                     log = (data_root / f"webtiles_policy.{slot}.log").open("ab")
                     runtime["logs"][slot] = log
-                    process = subprocess.Popen([
+                    command = [
                         sys.executable, "-u",
                         str(HERE / "webtiles_policy_agent.py"),
-                        "--checkpoint", str(checkpoint), "--variant", "c",
+                        "--checkpoint-manifest", str(manifest_path(
+                            data_root, "c", POLICY_LANES[slot])),
+                        "--variant", "c",
                         "--fresh", "--repeat", "--register",
                         "--username", username, "--password", "midca",
                         "--slot", str(slot), "--live-file",
                         str(data_root / f"webtiles_policy_live.{slot}.json"),
                         "--validation-minutes", "10", "--stall-timeout", "20",
                         "--retry", "1",
-                    ], cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+                    ]
+                    if POLICY_LANES[slot] == "champion":
+                        # The promoted lane is an evaluation canary, not an
+                        # exploration actor; make its replay reproducible.
+                        command.append("--deterministic")
+                    process = subprocess.Popen(
+                        command, cwd=HERE, stdout=log,
+                        stderr=subprocess.STDOUT)
                     runtime["processes"][slot] = process
                     started.append({"slot": slot, "pid": process.pid})
                 return self.send(202, json.dumps({
