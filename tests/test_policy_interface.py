@@ -53,13 +53,45 @@ class PolicyInterfaceTests(unittest.TestCase):
                                     "mon": {"id": 17}}]})
         self.assertIn((4, 5), view.hostiles)
 
+    def test_empty_glyph_delta_erases_stale_monster(self):
+        view = PolicyView()
+        view.player = {"pos": {"x": 4, "y": 5}}
+        view.apply_map({"cells": [{"x": 5, "y": 5, "g": "g",
+                                    "mon": {"id": 17, "att": 0}}]})
+        self.assertEqual(view.monsters_near(), 1)
+        view.apply_map({"cells": [{"x": 5, "y": 5, "g": ""}]})
+        self.assertNotIn((5, 5), view.grid)
+        self.assertNotIn((5, 5), view.hostiles)
+        self.assertEqual(view.monsters_near(), 0)
+
+    def test_null_monster_delta_erases_stale_monster_without_glyph(self):
+        view = PolicyView()
+        view.player = {"pos": {"x": 5, "y": 5}}
+        view.apply_map({"cells": [{"x": 5, "y": 5, "g": "g",
+                                    "mon": {"id": 7, "att": 0}}]})
+        self.assertEqual(view.monsters_near(), 1)
+
+        view.apply_map({"cells": [{"x": 5, "y": 5, "mon": None}]})
+
+        self.assertNotIn((5, 5), view.grid)
+        self.assertNotIn((5, 5), view.hostiles)
+        self.assertEqual(view.monsters_near(), 0)
+
+    def test_nonhostile_monster_metadata_overrides_letter_fallback(self):
+        view = PolicyView()
+        view.player = {"pos": {"x": 5, "y": 5}}
+        view.apply_map({"cells": [{"x": 5, "y": 5, "g": "g",
+                                    "mon": {"id": 9, "att": 4}}]})
+
+        self.assertEqual(view.monsters_near(), 0)
+
     def test_mobility_prevents_all_false_visible_mask(self):
         view = PolicyView()
         view.player = {"pos": {"x": 1, "y": 1}, "hp": 5, "hp_max": 10,
                        "status": [{"text": "Berserk"}]}
         view.hostiles.add((2, 1))
         names = [name for name, _ in VARIANTS["c"]]
-        mask, _ = visible_action_mask(names, view, (1, 1, 5, 1, 1), {})
+        mask, _ = visible_action_mask(names, view, (1, 1, 1, 1), {})
         self.assertTrue(any(mask))
         self.assertTrue(all(mask[names.index(name)]
                             for name, _ in MOBILITY))
@@ -69,12 +101,16 @@ class PolicyInterfaceTests(unittest.TestCase):
         view.player = {"depth": 1, "turn": 8, "hp": 20, "hp_max": 20,
                        "pos": {"x": 3, "y": 4}, "status": []}
         names = [name for name, _ in VARIANTS["c"]]
-        signature = (1, 8, 20, 3, 4)
+        signature = (1, 8, 3, 4)
         mask, _ = visible_action_mask(
             names, view, signature, {"move_n": signature})
         self.assertFalse(mask[names.index("move_n")])
         self.assertTrue(mask[names.index("move_e")])
-        changed = (1, 9, 20, 3, 4)
+        mask, _ = visible_action_mask(
+            names, view, signature, {"autofight": signature})
+        self.assertFalse(mask[names.index("autofight")])
+        self.assertTrue(mask[names.index("move_e")])
+        changed = (1, 9, 3, 4)
         mask, _ = visible_action_mask(
             names, view, changed, {"move_n": signature})
         self.assertTrue(mask[names.index("move_n")])

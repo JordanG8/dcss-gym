@@ -60,15 +60,17 @@ class PolicyView(View):
         if message.get("clear"):
             self.hostiles.clear()
             self.terrain.clear()
+        cleared_glyphs = set()
         cx = cy = 0
         for cell in message.get("cells", []):
             if "x" in cell:
                 cx = cell["x"]
             if "y" in cell:
                 cy = cell["y"]
-            if "mon" in cell:
+            has_mon = "mon" in cell
+            monster = cell.get("mon") if has_mon else None
+            if has_mon:
                 self.hostiles.discard((cx, cy))
-                monster = cell.get("mon")
                 if monster:
                     monster_id = monster.get("id")
                     if monster_id is not None and "att" in monster:
@@ -77,29 +79,47 @@ class PolicyView(View):
                         "att", self.monster_attitudes.get(monster_id))
                     if attitude == 0:
                         self.hostiles.add((cx, cy))
-            elif "g" in cell:
+                else:
+                    # An explicit null monster delta means the foreground
+                    # monster left this square. Some compact packets omit g=""
+                    # here, so erase any remembered monster letter as well.
+                    old_glyph = self.grid.get((cx, cy), "")
+                    if re.fullmatch(r"[A-Za-z]", old_glyph):
+                        cleared_glyphs.add((cx, cy))
+            if "g" in cell:
                 # A foreground glyph explicitly replaces the old foreground.
                 # Letter glyphs are monsters; metadata is normally present,
                 # but retaining this visible fallback handles compact deltas.
-                self.hostiles.discard((cx, cy))
                 glyph = cell.get("g", "")
-                if glyph != "@" and re.fullmatch(r"[A-Za-z]", glyph):
-                    self.hostiles.add((cx, cy))
+                if not glyph:
+                    cleared_glyphs.add((cx, cy))
+                if not has_mon:
+                    self.hostiles.discard((cx, cy))
+                    if glyph != "@" and re.fullmatch(r"[A-Za-z]", glyph):
+                        self.hostiles.add((cx, cy))
             glyph = cell.get("g")
             if (glyph is not None and glyph != "@"
                     and not re.fullmatch(r"[A-Za-z]", glyph)):
                 self.terrain[(cx, cy)] = glyph
             cx += 1
         super().apply_map(message)
+        # ``View.apply_map`` historically ignored falsey glyphs. In the
+        # WebTiles delta protocol, g="" explicitly erases the foreground; if
+        # we retain it, dead/out-of-sight monster letters become permanent
+        # ghost targets and the policy loops on rejected autofight forever.
+        for position in cleared_glyphs:
+            self.grid.pop(position, None)
+            self.terrain.pop(position, None)
 
     def monsters_near(self, radius=8):
         px, py = self.pos()
         exact = sum(abs(x - px) <= radius and abs(y - py) <= radius
                     for x, y in self.hostiles)
-        # Compact delta streams can omit `mon` after the initial foreground.
-        # The rendered letter is still player-visible and is the same fallback
-        # used by the original WebTiles observer.
-        return max(exact, super().monsters_near(radius))
+        # `hostiles` is updated both from authoritative visible monster
+        # metadata and from compact visible glyph-only deltas. Do not rescan
+        # the remembered grid here: it can contain out-of-sight monster
+        # letters between foreground erase packets and create ghost targets.
+        return exact
 
 
 def plain(text):
@@ -189,11 +209,16 @@ def choose(model, screen, deterministic, action_mask=None, hostile_cells=None):
 
 
 def visible_signature(view):
-    """Player-visible progress state used to scope a rejected-action mask."""
+    """Stable player-visible progress key for rejected command outcomes.
+
+    WebTiles emits several map/status deltas for one game turn. Monster packet
+    churn and HP redraws are observations, but they are not evidence that a
+    command consumed a turn. Only depth, turn, or position re-enables a command
+    that just produced no progress.
+    """
     p = view.player
     pos = p.get("pos") or {}
-    return (p.get("depth"), p.get("turn"), p.get("hp"),
-            pos.get("x"), pos.get("y"))
+    return (p.get("depth"), p.get("turn"), pos.get("x"), pos.get("y"))
 
 
 def visible_action_mask(names, view, signature, rejected_at):
@@ -699,16 +724,15 @@ async def run(args):
                 continue
             action_mask, masked_actions = visible_action_mask(
                 names, view, signature, rejected_at)
-            # A primitive action that leaves depth, turn, HP and position all
-            # unchanged was visibly rejected (normally a move into a wall).
-            # Scope the rejection to this exact observation so the policy can
-            # immediately choose another direction, while the same direction
-            # becomes legal again after any real progress.  This is an action
-            # mask derived from public outcome, not a scripted replacement.
+            # Any command that leaves all player-visible progress unchanged
+            # was rejected or was a no-op. This includes silent autofight
+            # failures as well as movement into a wall. Scope the rejection to
+            # this exact observation so the policy can immediately choose a
+            # different logit, while the action becomes legal again after any
+            # turn, movement, HP/status, depth, or visible-hostile change. This
+            # is a public-outcome action mask, not a scripted replacement.
             prior_name = decisions[-1].get("action") if decisions else None
-            if (prior_name and last_action_signature == signature
-                    and (prior_name.startswith("move_")
-                         or prior_name == "wait")):
+            if prior_name in names and last_action_signature == signature:
                 rejected_at[prior_name] = signature
                 action_mask, masked_actions = visible_action_mask(
                     names, view, signature, rejected_at)
