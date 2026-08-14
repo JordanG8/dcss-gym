@@ -1,0 +1,29 @@
+{
+  "format": "dcss-policy-certificate-v1",
+  "checkpoint": "rl_policy.c16.gym.pt",
+  "checkpoint_sha256": "b8e3983589a9024f840a86ca2657f745483a87e97b10f948de8a9de8ddfc6444",
+  "migrated_from_sha256": "94bb1333af597fd2ac701d1770839bddeeb4eea9a381132acfd51c6f8c178dd7",
+  "actions": [
+    "autofight", "explore", "rest", "descend", "travel", "escape",
+    "berserk", "move_n", "move_ne", "move_e", "move_se", "move_s",
+    "move_sw", "move_w", "move_nw", "wait"
+  ],
+  "observation": "80x24 public terminal plus player-visible hostile glyph bit",
+  "gym": {
+    "variant": "c",
+    "score": "12/12",
+    "skill_scores": {
+      "directional recovery": "8/8",
+      "enemy recognition": "2/2",
+      "status recovery": "1/1",
+      "survival": "1/1"
+    },
+    "minimum_required": 0.95
+  },
+  "live_validation": {
+    "agents": 8,
+    "minutes": 10,
+    "result": "passed",
+    "interface_failures": 0
+  }
+}

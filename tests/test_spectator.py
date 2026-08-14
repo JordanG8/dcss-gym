@@ -3,10 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spectator import load_frames, replay_files
+from spectator import is_tunnel_request, load_frames, replay_files
 
 
 class SpectatorTests(unittest.TestCase):
+    def test_cloudflare_viewer_cannot_use_control_endpoints(self):
+        self.assertTrue(is_tunnel_request(
+            {"CF-Connecting-IP": "203.0.113.4"}))
+        self.assertFalse(is_tunnel_request({"Host": "127.0.0.1:8101"}))
+
     def test_replays_are_listed_and_loaded_by_safe_stem(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
