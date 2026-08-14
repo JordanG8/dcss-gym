@@ -53,6 +53,19 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(legal["rest"])
         self.assertFalse(legal["escape"])
 
+    def test_visible_no_target_rejection_masks_autofight_retry(self):
+        env = object.__new__(DCSSEnv)
+        env.spec = VARIANTS["b"]
+        env.n_actions = len(env.spec)
+        env.menu_open = None
+        lines = ["#" * 40 + " " * 40 for _ in range(24)]
+        lines[13] = " " * 37 + "g   goblin" + " " * 32
+        lines[18] = "No reachable target in view."
+        env.c = _Screen("\n".join(lines))
+        legal = dict(zip((name for name, _ in env.spec), env.action_mask()))
+        self.assertFalse(legal["autofight"])
+        self.assertTrue(legal["berserk"])
+
     def test_visible_safety_masks_targetless_autofight(self):
         env = object.__new__(DCSSEnv)
         env.spec = VARIANTS["b"]

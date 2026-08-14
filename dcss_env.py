@@ -669,7 +669,11 @@ class DCSSEnv:
                 declined = getattr(self, "declined_menu_kinds", set())
                 for i, (name, _keys) in enumerate(self.spec):
                     if name == "autofight":
-                        mask[i] = hostile
+                        # A visible but unreachable monster can make Crawl
+                        # reject Tab. The rejection is itself visible in the
+                        # message pane; keep Tab masked only until some other
+                        # action changes the observation/progress state.
+                        mask[i] = hostile and not RE_NO_TARGET.search(scr)
                     elif name in {"explore", "rest"}:
                         mask[i] = not hostile
                     elif name == "escape":
